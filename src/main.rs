@@ -205,12 +205,15 @@ impl App {
         None
     }
 
-    fn blob_name(session: &str) -> String {
-        format!("{session}.bin")
+    fn blob_name(&self, session: &str) -> String {
+        // Backend signature is part of the filename: a blob saved under one
+        // backend (model/quant/template/ctx) must never restore into another
+        // — mismatched KV restore is silently wrong, not an error (fork §7).
+        format!("{}__{}.bin", session, self.backend_sig)
     }
 
     fn blob_path(&self, session: &str) -> PathBuf {
-        self.cfg.cache_dir.join(Self::blob_name(session))
+        self.cfg.cache_dir.join(self.blob_name(session))
     }
 
     /// v0 recency score = file mtime, bumped on serve + save.
@@ -265,7 +268,7 @@ impl App {
         let (code, v) = self
             .post_json(
                 &format!("/slots/{id}?action=save"),
-                json!({ "filename": Self::blob_name(session) }),
+                json!({ "filename": self.blob_name(session) }),
             )
             .await;
         if code.is_success() {
@@ -280,7 +283,7 @@ impl App {
         let (code, v) = self
             .post_json(
                 &format!("/slots/{id}?action=restore"),
-                json!({ "filename": Self::blob_name(session) }),
+                json!({ "filename": self.blob_name(session) }),
             )
             .await;
         if code.is_success() {
