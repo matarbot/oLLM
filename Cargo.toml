@@ -1,7 +1,7 @@
 [package]
 name = "ollm"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 description = "oLLM — a thin Rust proxy in front of llama.cpp's llama-server that adds a disk-backed prefix cache: warmed KV means optimal first-token latency on a fresh device."
 

@@ -214,28 +214,7 @@ impl App {
 
     /// v0 recency score = file mtime, bumped on serve + save.
     fn touch(&self, session: &str) {
-        let p = self.blob_path(session);
-        #[cfg(unix)]
-        {
-            use std::ffi::CString;
-            use std::os::unix::ffi::OsStrExt;
-            let now = {
-                let d = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default();
-                libc_timeval {
-                    tv_sec: d.as_secs() as i64,
-                    tv_nsec: d.subsec_nanos() as i64,
-                }
-            };
-            if let Ok(c) = CString::new(p.as_os_str().as_bytes()) {
-                unsafe { utimensat(c.as_ptr(), [now, now]) };
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = p;
-        }
+        bump_mtime_unix(&self.blob_path(session));
     }
 
     /// Byte-capped LRU eviction by mtime; 60 s grace for writes in flight.
@@ -345,21 +324,24 @@ impl App {
     }
 }
 
-// mtime bump without deps ----------------------------------------------------
+// mtime bump — safe, no FFI ---------------------------------------------------
 
-#[repr(C)]
-#[derive(Default, Clone, Copy)]
-struct libc_timeval {
-    tv_sec: i64,
-    tv_nsec: i64,
+/// Set a file's mtime (and atime) to now. Creates nothing: if the file
+/// vanished between save and touch, that is a benign race (blob gone = cold
+/// prefill next time). Uses FileTimes (Rust 1.75+) — no libc, no unsafe.
+#[cfg(unix)]
+fn bump_mtime_unix(path: &std::path::Path) {
+    use std::fs::File;
+    use std::fs::FileTimes;
+    if let Ok(f) = File::options().write(true).open(path) {
+        let times = FileTimes::new().set_modified(SystemTime::now());
+        let _ = f.set_times(times); // file may have been evicted concurrently
+    }
 }
 
-#[cfg(unix)]
-unsafe fn utimensat(path: *const i8, times: [libc_timeval; 2]) {
-    extern "C" {
-        fn utimensat(dirfd: i32, path: *const i8, times: *const libc_timeval, flags: i32) -> i32;
-    }
-    utimensat(-100 /* AT_FDCWD */, path, times.as_ptr(), 0);
+#[cfg(not(unix))]
+fn bump_mtime_unix(path: &std::path::Path) {
+    let _ = path;
 }
 
 // ---------------------------------------------------------------- handlers
