@@ -43,7 +43,9 @@ handoff mirrors its latest state).
 
 ## Open work (priority order)
 
-1. **Forest v1** — the next build. Today: per-session blobs only. Target:
+1. **Forest v1** — the next build. **Speced evening 2026-09-25: see
+   "Forest-v1 decisions + gates" below — first build item is the testability
+   refactor, and E12 is the physics gate the forest waits on.** Today: per-session blobs only. Target:
    prefix trees, longest-prefix-match at admission, leaf-first LRU eviction,
    promote hot spans to shared trunks. Key scheme already designed:
    `docs/design/design.md` §3 (chained hashes, root=compat_key). Hybrid
@@ -74,6 +76,90 @@ handoff mirrors its latest state).
    finalize the session-key contract with how Hermes sends `X-Session-Id`.
 6. **PARKED**: E8 flash-image warm-cache demo (Rain: "flagship is proven,
    UX polish, not for now"). Do NOT schedule it ahead of the forest.
+
+## Forest-v1 decisions + gates (settled 2026-09-25 evening, Rain)
+
+These decisions came out of a live design session and live ONLY here until
+extracted into docs/design/. Do not re-litigate; extend by amendment.
+
+### T0 — Testability refactor (FIRST build item, prerequisite for all forest code)
+- Split `src/main.rs` (741 lines, zero tests today) into `src/lib.rs` + a
+  thin `main`. Introduce `trait Backend` so the seed dance is a pure
+  orchestrator over scripted calls; unit tests run with NO GPU, NO live fs
+  (tempdir/in-memory manifest), no run-date dependency.
+- Behavior-preserving refactor: after it, `strict-write-test.sh` must still
+  pass unchanged — that is the proof no behavior moved.
+
+### T1 — `trait Backend` contract (the fake's vocabulary)
+| method | semantics |
+|---|---|
+| `slots()` | per-slot `id`, `is_processing`, `n_tokens` (position) |
+| `prefill_only(tokens)` | forward prompt with `n_predict=0`; slot ends at position N |
+| `save_slot(id, name)` | llama.cpp `?action=save` scratch → caller fsyncs+renames (R2) |
+| `restore_slot(id, name)` | `?action=restore`; 404 ⇒ cold-prefill fallback |
+| `chat(body)` | forward `/v1/chat/completions`, stream pass-through |
+
+Protocol tests against the fake (write BEFORE forest code):
+- miss ⇒ `prefill_only` strictly before `save_slot`; never save unconfirmed position
+- never `restore_slot` onto a dirty slot (R3 as an assertion, not log-reading)
+- second sight of same system-hash ⇒ `restore`, ZERO `prefill_only` calls
+- `save_slot` fails mid-seed ⇒ bag stays uncached, full request still served
+  normally, no dirty-slot leak
+- cap pressure ⇒ eviction yields only childless nodes; protected after tips
+
+### T2 — Forest-v1 decisions
+- **System-prompt bag**: hash of `messages[role=="system"]` TEXT (recognition
+  is structural — OpenAI wire format, no template parsing, no tokenization at
+  the proxy). Bag entry states: `uncached → queued → cached` (+ `failed`).
+- **Seed-on-first-sight** (Rain's decision, not second-time): at the miss,
+  in the same admission — `prefill_only(system)` → confirm `n_tokens == N`
+  and `is_processing == false` via `slots()` → `save_slot` → bag=`cached` →
+  forward the full request to the same slot (RAM prefix-match serves the
+  delta). Rationale: the first request pays that prefill regardless; a
+  second-time speculative seed pays it AGAIN (measured 72–90 s @ 15–30k,
+  IQ4_XS batch-1) and races the GPU. Second-time speculative seed only as
+  GPU-idle fallback when the first window was missed.
+- **Trunk = hash collision, not a category.** No special system-prompt code
+  paths in the forest proper; the bag is only the seeding policy. Byte-
+  equality is the contract: MyAgent's static prompt head ships byte-stable
+  per release; volatile injections (dates, memory context) go in the tail so
+  they branch off the trunk instead of breaking it.
+- **Eviction rules** (supersedes v0 flat mtime when the forest lands):
+  1. Structural invariant: only childless nodes are ever evictable —
+     children's keys derive from parents' hashes; evicting an interior node
+     orphans every blob beneath it. This IS leaf-first, stated correctly.
+  2. Stickiness by length (fixed 153 MB floor vs linear prefill cost):
+     childless AND `n_tokens >= OLLM_STICKY_MIN_TOKENS` ⇒ PROTECTED with a
+     30-day grace (`last_access`-pegged, ~one prompt-release cycle).
+     Threshold lives in config (a PARTIAL_ONLY-style tail trim later shifts
+     the whole curve stickier); pin the real value in E9 — back-of-envelope
+     crossing point is somewhere around 1–2k tokens, cite E9 when measured.
+  3. Everything else: pure mtime LRU among eligible (tips, non-sticky
+     childless, grace-expired trunks). Length never enters the score; it
+     enters via the protected class.
+  4. HARD-CAP OVERRIDE (the suicide-pact clause): grace is a preference,
+     never a cap violation. Under soft-cap pressure evict eligible first;
+     if still over cap, evict protected worst-first (oldest mtime) with a
+     log line. A month of accumulated prompt versions must never blow
+     `OLLM_CACHE_LIMIT_MB`.
+
+### T3 — E12: the physics gate (forest waits on this; runs on real hardware)
+Fork-at-boundary equivalence on the hybrid (Qwen3.8-27B IQ4_XS, box0):
+1. seed: `n_predict=0` prefill of the boot system prompt → save → seed blob
+2. cold arm: same system prompt + 3 DIFFERENT user messages, temp 0, fresh
+   slots — record continuations
+3. warm arm: backend restart, restore seed blob, fire the same 3 divergent
+   continuations
+4. token-level diff of arms. Identical ⇒ boundary restore is safe and
+   prefix sharing (forest, factory seed) is green-lit. Divergent ⇒ we learn
+   exactly where the boundary assumption breaks — worth more than another
+   week building on it. Run in-process variant first, then post-restart.
+Companion cheap test (same session decision): seed/cold equality —
+split-prefill (system-only, then full) vs monolithic, same continuation,
+temp 0 → identical bytes (proves `n_predict=0` saves land where the template
+says). Once both pass on the shipping model/config, freeze responses as
+golden fixtures; the fake replays them and CI never needs the box again
+until `backend_sig` rotates — test schedule mirrors compat-key schedule.
 
 ## Pitfalls (learned the expensive way — all live)
 
