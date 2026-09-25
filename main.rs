@@ -413,7 +413,6 @@ async fn chat_completions(
             let mut ttft_logged = false;
             let mut total = 0usize;
             let mut failed = false;
-            let mut disconnected = false;
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(b) => {
@@ -427,11 +426,8 @@ async fn chat_completions(
                         }
                         total += b.len();
                         if tx.send(Ok(b)).await.is_err() {
-                            // Client hung up (ctrl-c, head -c, cancelled turn).
-                            // The backend keeps generating regardless — keep
-                            // draining so we can still persist the finished KV;
-                            // just stop forwarding (channel closed anyway).
-                            disconnected = true;
+                            failed = true; // client disconnected early
+                            break;
                         }
                     }
                     Err(e) => {
@@ -446,7 +442,6 @@ async fn chat_completions(
                 bytes = total,
                 ms = %t0.elapsed().as_millis(),
                 failed,
-                disconnected,
                 "stream pump finished"
             );
             if !failed {
