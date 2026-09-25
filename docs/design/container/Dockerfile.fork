@@ -1,0 +1,95 @@
+# generated from docs/development/disk-cache/container/README.md step 1
+# ROCm repo block and cmake flags verbatim from
+# ~/source/setup/amd-strix-halo-toolboxes/toolboxes/Dockerfile.rocm-7.14
+# do not hand-edit the verbatim sections; regenerate from the recipe
+
+# ---------- builder ----------
+FROM registry.fedoraproject.org/fedora:44 AS builder
+
+# >>> ROCm repo heredoc block verbatim from Dockerfile.rocm-7.14 <<<
+# ROCm 7.14 Core SDK repository (TheRock release stream)
+RUN <<'EOF'
+tee /etc/yum.repos.d/rocm.repo <<REPO
+[rocm]
+name=ROCm 7.14.0
+baseurl=https://repo.amd.com/rocm/packages-multi-arch/rhel10/x86_64
+enabled=1
+priority=50
+gpgcheck=1
+gpgkey=https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg
+REPO
+EOF
+
+# upstream's toolchain set + ccache (parity: same meta-package the CI uses)
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      make gcc gcc-c++ cmake libcurl-devel ninja-build rdma-core-devel \
+      amdrocm-core-devel7.14-gfx1151 \
+      git-core ccache patch which \
+ && dnf clean all && rm -rf /var/cache/dnf/*
+
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    PATH=/opt/rocm/bin:/opt/rocm/core/bin:/opt/rocm/core/lib/llvm/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/rocm/core/lib/rocm_sysdeps/lib:/opt/rocm/core/lib \
+    CCACHE_DIR=/ccache CCACHE_MAXSIZE=5G
+
+# source comes from the build context (the fork tree); patches from a named context.
+# COPY only - bind mounts of host paths into RUN fail on this box (context-relative
+# resolution, and SELinux denial for named-context binds). See HANDOFF section 2.
+WORKDIR /opt/llama-fork-src
+COPY . /opt/llama-fork-src/
+COPY --from=patches llama-grammar.patch /tmp/patches/
+COPY --from=patches llama-cpp-25992-rocm-host-buffer.patch /tmp/patches/
+
+# parity patches: BOTH are required to match production behaviour, and this fork
+# contains neither (verified: src/llama-grammar.cpp MAX_REPETITION_THRESHOLD is 2000;
+# the #25992 host-buffer symbols are absent). `best` = warn and continue,
+# `strict` = fail the build, `none` = knowingly diverge.
+ARG APPLY_PATCHES=best
+RUN set -eu; cd /opt/llama-fork-src; for p in /tmp/patches/*.patch; do \
+      if patch -p1 --dry-run --silent < "$p" 2>/dev/null; then \
+        patch -p1 --silent < "$p"; echo "applied $(basename "$p")"; \
+      elif patch -p1 --reverse --dry-run --silent < "$p" 2>/dev/null; then \
+        echo "already present: $(basename "$p")"; \
+      else \
+        echo "PATCH DOES NOT APPLY: $(basename "$p")"; \
+        [ "$APPLY_PATCHES" = strict ] && exit 1; \
+        [ "$APPLY_PATCHES" = best ] && echo "  continuing WITHOUT production parity"; \
+      fi; done
+
+# >>> cmake flags verbatim from upstream <<<
+#     -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1151 -DCMAKE_BUILD_TYPE=Release
+#     -DGGML_RPC=ON -DROCM_PATH=/opt/rocm -DHIP_PLATFORM=amd
+# deltas: install prefix /opt/llama-fork, ccache launcher, EXTRA_CMAKE_ARGS, BUILD_JOBS
+ARG CMAKE_BUILD_TYPE=Release
+ARG BUILD_JOBS=
+RUN --mount=type=cache,target=/ccache set -eu; \
+    cmake -S /opt/llama-fork-src -B /opt/llama-fork-build \
+      -DGGML_HIP=ON \
+      -DAMDGPU_TARGETS=gfx1151 \
+      -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+      -DGGML_RPC=ON \
+      -DROCM_PATH=/opt/rocm \
+      -DHIP_PLATFORM=amd \
+      -DCMAKE_INSTALL_PREFIX=/opt/llama-fork \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      ${EXTRA_CMAKE_ARGS:-} \
+ && JOBS=${BUILD_JOBS:-$(nproc)} && cmake --build /opt/llama-fork-build -- -j$JOBS \
+ && cmake --install /opt/llama-fork-build
+
+# ---------- runtime ----------
+# buildah does not resolve ARGs in FROM of later stages; pin the base here
+# (same image the production units run; docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.14)
+FROM docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-7.14 AS runtime
+
+COPY --from=builder /opt/llama-fork/ /opt/llama-fork/
+RUN printf '%s\n%s\n' /opt/llama-fork/lib /opt/llama-fork/lib64 \
+      > /etc/ld.so.conf.d/zz-llama-fork.conf && ldconfig
+
+ARG GIT_REF=unknown GIT_SHA=unknown GIT_DIRTY=unknown BASE_IMAGE_TAG=unknown BUILD_DATE=unknown
+RUN { echo "ref=${GIT_REF}"; echo "sha=${GIT_SHA}"; echo "dirty=${GIT_DIRTY}"; \
+      echo "base=${BASE_IMAGE_TAG}"; echo "built=${BUILD_DATE}"; } > /opt/llama-fork/BUILDINFO
+
+ENV PATH=/opt/llama-fork/bin:$PATH
+CMD ["llama-server", "--version"]

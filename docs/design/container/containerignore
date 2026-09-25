@@ -1,0 +1,6 @@
+.git
+build
+build-*
+DiskC*
+*.gguf
+plans
