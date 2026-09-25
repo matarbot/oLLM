@@ -1,0 +1,20 @@
+[package]
+name = "ollm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "oLLM — a thin Rust proxy in front of llama.cpp's llama-server that adds a disk-backed prefix cache: warmed KV means optimal first-token latency on a fresh device."
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde_json = "1"
+sha2 = "0.10"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+strip = true
