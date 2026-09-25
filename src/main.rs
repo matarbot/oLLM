@@ -37,7 +37,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 // ------------------------------------------------------------------ config
 
@@ -128,6 +128,10 @@ fn session_key(headers: &HeaderMap, body: &Value, header_name: &str) -> String {
 
 struct SlotInfo {
     session: Option<String>,
+    /// true from the moment a turn is steered to this slot until the
+    /// post-turn save publishes. A dirty slot is NEVER stolen.
+    dirty: bool,
+    busy: bool,
 }
 
 struct App {
@@ -135,6 +139,17 @@ struct App {
     http: Client,
     backend_sig: String,
     slots: Mutex<HashMap<u32, SlotInfo>>,
+    /// Strict write rules (the oMLX reliability contract):
+    /// R1 — a write holds this gate exclusively: while any blob is being
+    ///      written (post-turn save, eviction save), incoming requests block
+    ///      at the prefix matcher until the write publishes. Matching never
+    ///      runs against an unsettled forest.
+    /// R2 — publication is atomic: llama.cpp writes a `.save` scratch file,
+    ///      oLLM fsyncs it and renames it into place. The forest only ever
+    ///      contains complete blobs.
+    /// R3 — save-before-steal: a slot is never steered to a new session
+    ///      while dirty or processing; its state is published first.
+    write_gate: tokio::sync::RwLock<()>,
 }
 
 impl App {
@@ -177,7 +192,11 @@ impl App {
         }
     }
 
-    /// Pick a slot for `session`: known-hot first, else idle, else backend auto.
+    /// R3: pick a slot for `session`.
+    /// 1. the slot already owned by this session (hot, steer straight back)
+    /// 2. a slot that is neither processing nor dirty in oLLM's view
+    /// 3. otherwise None -> caller forwards without steering (backend
+    ///    auto-schedules onto a genuinely free slot; we never evict A for B)
     async fn pick_slot(&self, session: &str) -> Option<(u32, bool)> {
         {
             let g = self.slots.lock().await;
@@ -196,13 +215,65 @@ impl App {
                 .get("is_processing")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(true);
-            g.entry(id)
-                .or_insert(SlotInfo { session: None });
-            if !processing {
-                return Some((id, false));
+            let e = g.entry(id).or_insert(SlotInfo { session: None, dirty: false, busy: false });
+            e.busy = processing;
+            // R3: never steal a processing or dirty slot.
+            if processing || e.dirty {
+                continue;
+            }
+            return Some((id, false));
+        }
+        None
+    }
+
+    /// Publish a dirty slot's KV before stealing it (write-on-eviction).
+    /// Returns the evicted session id (if any) so the caller can log it.
+    async fn find_evictable(&self) -> Option<(u32, Option<String>)> {
+        let slots = self.get_json("/slots").await.ok()?;
+        let arr = slots.as_array()?;
+        let mut g = self.slots.lock().await;
+        for s in arr {
+            let id = s.get("id")?.as_u64()? as u32;
+            let processing = s
+                .get("is_processing")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true);
+            if processing {
+                continue;
+            }
+            let e = g.entry(id).or_insert(SlotInfo { session: None, dirty: false, busy: false });
+            e.busy = false;
+            if e.dirty {
+                // publish first (save_slot runs under the exclusive gate and
+                // marks clean); caller must save before returning it
+                return Some((id, e.session.clone()));
             }
         }
         None
+    }
+
+    async fn evict_to_disk(&self, id: u32, victim: Option<String>) -> bool {
+        if let Some(v) = &victim {
+            tracing::info!(slot = id, victim = %v, "write-on-eviction: publishing victim");
+            self.save_slot(id, v).await
+        } else {
+            true // nothing to publish
+        }
+    }
+
+    /// Mark a slot as holding `session` and dirty (a turn ran / is running
+    /// on it; its state must be published before anyone else may use it).
+    async fn mark_dirty(&self, id: u32, session: &str) {
+        let mut g = self.slots.lock().await;
+        let e = g.entry(id).or_insert(SlotInfo { session: None, dirty: false, busy: false });
+        e.session = Some(session.to_string());
+        e.dirty = true;
+    }
+
+    async fn mark_clean(&self, id: u32) {
+        if let Some(s) = self.slots.lock().await.get_mut(&id) {
+            s.dirty = false;
+        }
     }
 
     fn blob_name(&self, session: &str) -> String {
@@ -264,21 +335,58 @@ impl App {
         .await;
     }
 
-    async fn save_slot(&self, id: u32, session: &str) {
+    /// R1+R2: publish the slot's KV to disk. Takes the write gate
+    /// exclusively (matching blocks), saves to a scratch filename, fsyncs,
+    /// renames into place. After rename the blob is visible and complete.
+    async fn save_slot(&self, id: u32, session: &str) -> bool {
+        let _w = self.write_gate.write().await;
+        let scratch = format!("{}.save", self.blob_name(session));
         let (code, v) = self
             .post_json(
                 &format!("/slots/{id}?action=save"),
-                json!({ "filename": self.blob_name(session) }),
+                json!({ "filename": scratch }),
             )
             .await;
-        if code.is_success() {
-            self.touch(session);
-            tracing::info!(slot = id, session, ?v, "slot saved to disk");
-        } else {
+        if !code.is_success() {
             tracing::warn!(slot = id, session, %code, ?v, "slot save failed");
+            return false;
         }
+        let final_path = self.blob_path(session);
+        let scratch_path = self.cfg.cache_dir.join(&scratch);
+        let moved = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let f = std::fs::File::open(&scratch_path)?; // llama.cpp closed it
+            f.sync_all()?; // durability before visibility
+            std::fs::rename(&scratch_path, &final_path)?; // atomic publish
+            if let Some(parent) = final_path.parent() {
+                if let Ok(d) = std::fs::File::open(parent) {
+                    let _ = d.sync_all(); // index durability
+                }
+            }
+            Ok(())
+        })
+        .await;
+        let published = match moved {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                tracing::warn!(session, io = %e, "publish err");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(session, join = %e, "publish join err");
+                false
+            }
+        };
+        if published {
+            self.touch(session);
+            self.mark_clean(id).await;
+            tracing::info!(slot = id, session, ?v, "blob published (atomic)");
+        }
+        published
     }
 
+    /// R1: restore runs AFTER the lookup phase; blobs are rename-published
+    /// (complete or absent), so a plain restore is race-free. If the blob
+    /// was evicted mid-flight, llama.cpp 404s -> cold prefill fallback.
     async fn restore_slot(&self, id: u32, session: &str) {
         let (code, v) = self
             .post_json(
@@ -292,39 +400,6 @@ impl App {
         } else {
             tracing::warn!(slot = id, session, %code, ?v, "restore failed (cold prefill fallback)");
         }
-    }
-
-    /// Poll until the slot stops processing, then persist it.
-    async fn wait_idle_then_save(&self, id: u32, session: &str) {
-        for _ in 0..1200 {
-            let busy = self
-                .get_json("/slots")
-                .await
-                .ok()
-                .and_then(|v| {
-                    v.as_array().map(|a| {
-                        a.iter().any(|s| {
-                            s.get("id").and_then(|x| x.as_u64()) == Some(id as u64)
-                                && s.get("is_processing")
-                                    .and_then(|x| x.as_bool())
-                                    .unwrap_or(false)
-                        })
-                    })
-                })
-                .unwrap_or(true);
-            if !busy {
-                let mut g = self.slots.lock().await;
-                if let Some(s) = g.get_mut(&id) {
-                    s.session = Some(session.to_string());
-                }
-                drop(g);
-                self.save_slot(id, session).await;
-                self.enforce_limit().await;
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        tracing::warn!(slot = id, session, "wait_idle_then_save timed out");
     }
 }
 
@@ -362,20 +437,50 @@ async fn chat_completions(
     };
 
     let session = session_key(&headers, &parsed, &app.cfg.session_header);
-    let disk_hit = app.blob_path(&session).exists();
 
-    // admission
-    let mut steer: Option<u32> = None;
-    if let Some((id, hot)) = app.pick_slot(&session).await {
-        if disk_hit && !hot {
-            app.restore_slot(id, &session).await; // synchronous: must precede forward
+    // R1: the prefix match (lookup) holds the gate shared — it waits for
+    // any in-flight publish and blocks publishes while it decides. Decode
+    // itself runs outside the gate; saves take it exclusive at turn end,
+    // so the next request's matcher always sees a settled forest.
+    let lookup = {
+        let _match = app.write_gate.read().await;
+        let disk_hit = app.blob_path(&session).exists();
+        (disk_hit, app.pick_slot(&session).await)
+    };
+    let (disk_hit, picked) = lookup;
+
+    // admission (R3)
+    let steer: Option<u32> = match picked {
+        Some((id, hot)) => {
+            if disk_hit && !hot {
+                app.restore_slot(id, &session).await;
+            }
+            app.mark_dirty(id, &session).await; // its KV is authoritative now
+            Some(id)
         }
-        if disk_hit || hot {
-            steer = Some(id);
-        } else {
-            steer = Some(id); // steer anyway so the conversation accumulates somewhere
+        None => {
+            // eviction path: a new session needs a slot and all known slots
+            // are busy-or-dirty. Publish the dirty slot's KV first (this is
+            // the "write upon eviction" rule), then steer there. If every
+            // slot is still processing, forward unsteered — never drop a
+            // session's state silently.
+            let free = app.find_evictable().await;
+            if let Some((id, victim)) = free {
+                // write-on-eviction: publish the victim's KV before steal
+                if app.evict_to_disk(id, victim.clone()).await {
+                    if disk_hit {
+                        app.restore_slot(id, &session).await;
+                    }
+                    app.mark_dirty(id, &session).await;
+                    Some(id)
+                } else {
+                    None // publish failed: do not steal an unpersisted slot
+                }
+            } else {
+                None
+            }
         }
-    }
+    };
 
     let mut fwd = parsed.clone();
     let is_stream = fwd.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -586,6 +691,7 @@ async fn main() -> anyhow::Result<()> {
             http: http.clone(),
             backend_sig: String::new(),
             slots: Mutex::new(HashMap::new()),
+            write_gate: RwLock::new(()),
         };
         app_probe.get_json("/props").await
     } {
@@ -609,6 +715,7 @@ async fn main() -> anyhow::Result<()> {
         http,
         backend_sig: backend_sig.clone(),
         slots: Mutex::new(HashMap::new()),
+        write_gate: RwLock::new(()),
     });
 
     tracing::info!(
