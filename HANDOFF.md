@@ -1,0 +1,142 @@
+# HANDOFF — oLLM (as of 2026-09-25, ~18:00 CEST)
+
+For the next agent picking this up. Read me, then `README.md` (product spec),
+then `docs/design/README.md` (vendored deep design, historical framing).
+Durable memory: deep-memory `projects/ollm-proxy.md` (the running log — this
+handoff mirrors its latest state).
+
+## Live state right now (verified at handoff time)
+
+- backend `http://127.0.0.1:1245` — healthy. Runs in podman container
+  **`llama-rocm2`** (NOT `llama-rocm-7.14` — that container died 2026-09-25,
+  overlay corrupted, unrecoverable; do not try to start it).
+  Start/restart: `bash ~/ollm-cache/start-backend.sh` (idempotent, recreates
+  llama-rocm2 with correct binds if missing, polls health).
+  Model: Qwen3.8-27B UD-IQ4_XS + MTP draft. API key: `~/ollm-cache/.backend_key`.
+- proxy `http://127.0.0.1:1247` — healthy, debug binary from
+  `~/source/oLLM/target/debug/ollm`, started by `~/ollm-cache/start-stack.sh`
+  (start-stack also starts the backend if down; logs `~/ollm-cache/ollm.log`).
+  `backend_sig=a67e59194299` — blobs in cache are keyed with this; it changes
+  if the backend's model/config fingerprint changes (by design: stale blobs go inert).
+- repo `~/source/oLLM`, remote `github.com/matarbot/oLLM`, main `c068e09`,
+  clean tree. ~470-line `src/main.rs`, edition 2024, zero `unsafe`.
+- cache dir `~/ollm-cache/slots` (~1.3 GB, 9 blobs), cap `OLLM_CACHE_LIMIT_MB=2048`.
+
+## What is DONE and verified (don't redo)
+
+- E1 slot save/restore ground truth: save 16 ms/153 MB, restore 13 ms, KV +
+  recurrent state intact; blob = whole-slot FLAGS_NONE, ~153 MB floor +
+  ~34 KB/token. `save` works even while a slot is processing (don't assume idle-only).
+- Persistence proof: hard backend kill → restore → recall (`KIWI-77`,
+  `persistence-proof.sh`). Streaming + recall (`THETA-9`, `stream-test.sh`).
+- Strict write rules (Rain's spec) implemented + verified (`4b50912`,
+  `strict-write-test.sh` → recall `OMEGA-55`):
+  1. write gate: lookup shared / publish exclusive (tokio RwLock)
+  2. transactional publish: `.save` scratch → fsync file+dir → atomic rename
+  3. dirty-slot registry: never steal/restore-over unpublished KV;
+     write-on-eviction publishes victim before steal; failed publish ⇒ no steal
+  4. compat gate: `backend_sig` embedded in blob filename
+     (`session__<sig>.bin`, `88e1e71`)
+- Streaming save race fixed: save is driven by pump-to-EOF in a spawned task,
+  survives client disconnect. Never go back to slot-idle polling.
+- Session key: `X-Session-Id` header (or prompt-hash fallback).
+
+## Open work (priority order)
+
+1. **Forest v1** — the next build. Today: per-session blobs only. Target:
+   prefix trees, longest-prefix-match at admission, leaf-first LRU eviction,
+   promote hot spans to shared trunks. Key scheme already designed:
+   `docs/design/design.md` §3 (chained hashes, root=compat_key). Hybrid
+   constraint: a node can only be born where a save naturally ends
+   (end-of-message span, or `n_predict=0` boundary) — recurrent state cannot
+   be sliced mid-conversation. Chunk-boundary RAM sharing verified working
+   (E7, build b10627), but cross-conversation *blob* restore mid-thread is
+   silently wrong — only boundary snapshots are safe.
+   E9 (restore-depth vs prefill-cost economics) belongs inside this.
+2. **Queueing levers** (decided 2026-09-25, ladder-grounded, NOT yet coded):
+   - `OLLM_MAX_INFLIGHT=1` admission semaphore (N=2 gives 7.3+7.3 tok/s,
+     serial gives 21.7→21.7; MTP only pays off at N=1 — ladder `+64%`)
+   - SJF forward order: restore-hit (~13 ms) before cold prefill (72–90 s @15–30k)
+   - same-session barge-in priority for interrupt sequences
+   - defer publish fsync/rename to GPU-idle windows
+   Aggregate throughput is flat ~22 tok/s at any N — queueing reshapes
+   fairness, never creates capacity. Warm ladder through proxy = phase 2.
+3. **Fork-semantics tests** (Rain's scenarios): fork at 70%/95% (message-span
+   boundaries — that's the ONLY legal save point on hybrid), original must
+   stay clean, both lineages restore independently after restart, cost curve
+   vs cut depth is a measurement, not a correctness question.
+4. **Interrupt capture** — needs Rain at the desktop app: watch proxy logs
+   while Rain interrupts a Hermes turn; encode what Hermes actually does
+   (stop? cancel? full-history resend?) as oLLM's contract.
+5. **Ops**: systemd units for backend+proxy on box0 (currently nohup —
+   must self-heal at boot; yesterday the container death nearly orphaned
+   everything); `cargo build --release`; LICENSE (README says TBD);
+   finalize the session-key contract with how Hermes sends `X-Session-Id`.
+6. **PARKED**: E8 flash-image warm-cache demo (Rain: "flagship is proven,
+   UX polish, not for now"). Do NOT schedule it ahead of the forest.
+
+## Pitfalls (learned the expensive way — all live)
+
+- `pkill -f llama-server` / `-f start-backend` over ssh matches the ssh
+  command itself → kills your session. Use `[l]lama-server`, `pkill -x`,
+  or kill by explicit pid.
+- Never send nested-quote curl/json through `ssh '...'` — write a script
+  file, scp it, run `bash file.sh`. Quoting has eaten hours.
+- `podman exec -d ... > file` redirects on the HOST, not in the container.
+  Wrap in `sh -c '... > /home/rain/...'` (bind mount makes it visible both sides).
+- Container at uid 1000 cannot read `/home/rain` bind (perms) — llama-rocm2
+  runs as root for exactly this reason. `--user 1000:1000` breaks
+  `--slot-save-path` with EACCES.
+- `usage.cached_tokens` is unreliable on this server. Verify KV reuse via
+  proxy logs (restore/publish lines) + backend `timings`, not usage fields.
+- qwen3.8 emits `reasoning_content` before `content`. Empty-looking answers
+  are usually reasoning eating `max_tokens` — check reasoning_content before
+  declaring a cache failure. Content decode ~97–102 chars/s; cold prefill
+  72–90 s at 15–30k. All perf claims must cite a measured number + workload
+  (an unverified "30+ tok/s" was corrected in the vault — don't reintroduce it).
+- Health `cache_mb` showed 4217 (>2048 cap) once mid-write — suspected
+  double-count of scratch `.save` during enforcement. Cache-pressure test
+  is owed; enforcement path is untested under real pressure.
+- Backend restart changes nothing in the blob keys unless config fingerprint
+  changes (sig stayed `a67e59194299` across this session's rebuild —
+  same image, same flags).
+
+## Settled decisions (don't relitigate; revisit trigger on record)
+
+- **No vLLM.** Disk prefix caching = GPU-RAM pool (same UMA competition
+  Rain rejected for `--cache-ram`); gfx1151 fast paths incomplete; batch-1
+  device ⇒ vLLM's edge inert; shipping quant is IQ4_XS GGUF. Revisit ONLY
+  if a measured gfx1151 vLLM row beats llama.cpp+MTP at batch-1 on this
+  exact model/quant (E11 probe).
+- oLLM = thin Rust proxy, no llama.cpp submodule, backend via env vars.
+- Scoring v0 = mtime LRU only, no density weighting yet.
+- Fork of llama.cpp lives on as `~/source/llama-cpp-rain-sk` (docs vendored
+  here; design.md §3/§6/§7 carry over). **Careful:** its remote still points
+  at `rain-sk/oLLM.git`, which Rain plans to delete — before that happens,
+  re-point the fork's remote or Rain must accept the local tree as the only
+  copy. Fork also has uncommitted changes (docs banner + a pre-existing
+  `server-context.cpp` edit) — ask Rain before touching that tree.
+
+## Where everything lives
+
+| what | path |
+|---|---|
+| proxy repo | box0 `~/source/oLLM` → `github.com/matarbot/oLLM` |
+| scaffold mirror (pxl) | `/home/rain/ollm-scaffold/` (synced via scp) |
+| backend key | box0 `~/ollm-cache/.backend_key` |
+| start scripts | box0 `~/ollm-cache/{start-stack,start-backend}.sh` |
+| tests | box0 `~/ollm-cache/{smoke,strict-write-test,stream-test,persistence-proof}.sh` |
+| proxy log | box0 `~/ollm-cache/ollm.log` |
+| cache blobs | box0 `~/ollm-cache/slots/*.bin` |
+| C++ fork + design corpus | box0 `~/source/llama-cpp-rain-sk` |
+| capacity ladder | pxl `~/projects/box0/sustained-agent-ladder.md` + `ladder.jsonl` |
+| running design log | deep-memory `projects/ollm-proxy.md` |
+| prior sessions | this one (`20260925_124705_14c21e`), ladder+enterprise session (`20260925_151716_8a011d`) |
+
+## Verification ritual
+
+After any change: `cargo build`, restart via `start-stack.sh`, then
+`bash ~/ollm-cache/strict-write-test.sh` — expect turn1 `remembered`,
+a `blob published (atomic)` log line, turn2 recall `OMEGA-55`. If the
+backend was restarted, confirm `backend_sig` first: if it changed, expect a
+cold prefill on turn 1 (correct behavior, not a bug).
