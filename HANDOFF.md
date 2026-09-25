@@ -110,12 +110,12 @@ handoff mirrors its latest state).
   exact model/quant (E11 probe).
 - oLLM = thin Rust proxy, no llama.cpp submodule, backend via env vars.
 - Scoring v0 = mtime LRU only, no density weighting yet.
-- Fork of llama.cpp lives on as `~/source/llama-cpp-rain-sk` (docs vendored
-  here; design.md §3/§6/§7 carry over). **Careful:** its remote still points
-  at `rain-sk/oLLM.git`, which Rain plans to delete — before that happens,
-  re-point the fork's remote or Rain must accept the local tree as the only
-  copy. Fork also has uncommitted changes (docs banner + a pre-existing
-  `server-context.cpp` edit) — ask Rain before touching that tree.
+- **The llama.cpp fork is DEAD (Rain, 2026-09-25).** `rain-sk/oLLM` remote deleted;
+  local tree `~/source/llama-cpp-rain-sk` deleted along with its rescue bundle — the
+  23 disk-cache commits are intentionally discarded ("we don't need the details").
+  All durable value was already vendored into this repo at `docs/design/` (verified
+  identical before deletion). C++ work restarts from `~/source/llama-cpp-upstream`
+  @ `e70802a01` (build 10664 = exactly what llama-rocm2 runs today).
 
 ## Where everything lives
 
@@ -128,7 +128,7 @@ handoff mirrors its latest state).
 | tests | box0 `~/ollm-cache/{smoke,strict-write-test,stream-test,persistence-proof}.sh` |
 | proxy log | box0 `~/ollm-cache/ollm.log` |
 | cache blobs | box0 `~/ollm-cache/slots/*.bin` |
-| C++ fork + design corpus | box0 `~/source/llama-cpp-rain-sk` |
+| C++ base (upstream clone @ running build) | box0 `~/source/llama-cpp-upstream` branch `running-build` = `e70802a01` |
 | capacity ladder | pxl `~/projects/box0/sustained-agent-ladder.md` + `ladder.jsonl` |
 | running design log | deep-memory `projects/ollm-proxy.md` |
 | prior sessions | this one (`20260925_124705_14c21e`), ladder+enterprise session (`20260925_151716_8a011d`) |
