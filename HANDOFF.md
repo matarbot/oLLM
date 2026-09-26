@@ -19,7 +19,9 @@ handoff mirrors its latest state).
   `backend_sig=a67e59194299` — blobs in cache are keyed with this; it changes
   if the backend's model/config fingerprint changes (by design: stale blobs go inert).
 - repo `~/source/oLLM`, remote `github.com/matarbot/oLLM`, main `c068e09`,
-  clean tree. ~470-line `src/main.rs`, edition 2024, zero `unsafe`.
+  clean tree. Since 2026-09-26: `src/main.rs` split into `src/lib.rs` (app +
+  `pub mod backend` / `seed`) + 15-line `main`; `trait Backend` + scripted
+  fake + 7 protocol tests. Edition 2024, zero `unsafe`.
 - cache dir `~/ollm-cache/slots` (~1.3 GB, 9 blobs), cap `OLLM_CACHE_LIMIT_MB=2048`.
 
 ## What is DONE and verified (don't redo)
@@ -82,26 +84,42 @@ handoff mirrors its latest state).
 These decisions came out of a live design session and live ONLY here until
 extracted into docs/design/. Do not re-litigate; extend by amendment.
 
-### T0 — Testability refactor (FIRST build item, prerequisite for all forest code)
-- Split `src/main.rs` (741 lines, zero tests today) into `src/lib.rs` + a
-  thin `main`. Introduce `trait Backend` so the seed dance is a pure
-  orchestrator over scripted calls; unit tests run with NO GPU, NO live fs
-  (tempdir/in-memory manifest), no run-date dependency.
-- Behavior-preserving refactor: after it, `strict-write-test.sh` must still
-  pass unchanged — that is the proof no behavior moved.
+### T0 — Testability refactor (DONE 2026-09-26, box0)
+- `src/main.rs` (741 lines, zero tests) split into `src/lib.rs` + thin
+  thin `main.rs` (17 lines). `src/backend.rs` = `trait Backend` + `LlamaBackend`
+  (real reqwest impl) + `SlotState`/`ChatOutcome`. `src/fake.rs` = scripted
+  fake with call recording. `src/seed.rs` = the seed-dance orchestrator
+  (`SeedDance::<B,P>` + bag + `Publisher` trait, `FsPublisher` real /
+  `MemoryPublisher` test) — NOT yet wired into the request path (waits on
+  E12).
+- Behavior preserved: after the refactor, `strict-write-test.sh` passed
+  unchanged (turn1 publish → turn2 recall `OMEGA-55`; sig still
+  `a67e59194299`). `cargo test` = 7/7 green, no GPU, no live fs, no
+  run-date dependency.
 
 ### T1 — `trait Backend` contract (the fake's vocabulary)
 | method | semantics |
 |---|---|
-| `slots()` | per-slot `id`, `is_processing`, `n_tokens` (position) |
+| `slots()` | per-slot `id`, `is_processing`, `n_tokens` (position; on this build the field is the slot's `n_prompt_tokens` — verified live 2026-09-26) |
 | `prefill_only(tokens)` | forward prompt with `n_predict=0`; slot ends at position N |
 | `save_slot(id, name)` | llama.cpp `?action=save` scratch → caller fsyncs+renames (R2) |
 | `restore_slot(id, name)` | `?action=restore`; 404 ⇒ cold-prefill fallback |
 | `chat(body)` | forward `/v1/chat/completions`, stream pass-through |
 
-Protocol tests against the fake (write BEFORE forest code):
+Protocol tests against the fake (ALL WRITTEN 2026-09-26 in `seed.rs`, 7/7 green — the last two remain as the forest's acceptance tests):
 - miss ⇒ `prefill_only` strictly before `save_slot`; never save unconfirmed position
 - never `restore_slot` onto a dirty slot (R3 as an assertion, not log-reading)
+- (box0 amendment 2026-09-25, EXECUTED 2026-09-26) position-trust check —
+  **ran live, caught a real bug**: the running backend's `/slots` has NO
+  `n_tokens` field at all; the slot's true context position is
+  `n_prompt_tokens` (verified: an `n_predict=0` prefill of a 59-token system
+  prompt leaves `n_prompt_tokens == 59` on an idle slot;
+  `n_prompt_tokens_processed` is 0 when idle and is NOT the position). The
+  fake initially masked this by reporting `n_tokens` — exactly the gap the
+  check exists for. `LlamaBackend::slots()` fixed to read
+  `n_prompt_tokens` (see `SlotState` doc); the fake keeps `n_tokens` as the
+  contract name. "Never save an unconfirmed position" now rests on a field
+  verified live, not on the fake's word.
 - second sight of same system-hash ⇒ `restore`, ZERO `prefill_only` calls
 - `save_slot` fails mid-seed ⇒ bag stays uncached, full request still served
   normally, no dirty-slot leak
@@ -110,7 +128,9 @@ Protocol tests against the fake (write BEFORE forest code):
 ### T2 — Forest-v1 decisions
 - **System-prompt bag**: hash of `messages[role=="system"]` TEXT (recognition
   is structural — OpenAI wire format, no template parsing, no tokenization at
-  the proxy). Bag entry states: `uncached → queued → cached` (+ `failed`).
+  the proxy). Bag entry states: `uncached → cached` (+ `failed`). (The
+  `queued` state was dropped 2026-09-25: seed-on-first-sight seeds in the
+  same admission, so nothing ever sits in a queue.)
 - **Seed-on-first-sight** (Rain's decision, not second-time): at the miss,
   in the same admission — `prefill_only(system)` → confirm `n_tokens == N`
   and `is_processing == false` via `slots()` → `save_slot` → bag=`cached` →
@@ -154,6 +174,11 @@ Fork-at-boundary equivalence on the hybrid (Qwen3.8-27B IQ4_XS, box0):
    prefix sharing (forest, factory seed) is green-lit. Divergent ⇒ we learn
    exactly where the boundary assumption breaks — worth more than another
    week building on it. Run in-process variant first, then post-restart.
+5. (box0 amendment 2026-09-25) MTP isolation: run arms with spec decoding
+   OFF (pure greedy) first — the shipping config has `--spec-type
+   draft-mtp`, so a divergence with MTP on is ambiguous (restore vs. spec
+   path). Only after greedy arms are byte-identical, optionally re-run with
+   MTP on to characterize the spec path separately.
 Companion cheap test (same session decision): seed/cold equality —
 split-prefill (system-only, then full) vs monolithic, same continuation,
 temp 0 → identical bytes (proves `n_predict=0` saves land where the template
@@ -221,7 +246,8 @@ until `backend_sig` rotates — test schedule mirrors compat-key schedule.
 
 ## Verification ritual
 
-After any change: `cargo build`, restart via `start-stack.sh`, then
+After any change: `cargo build`, `cargo test` (7 protocol tests, no GPU),
+restart via `start-stack.sh`, then
 `bash ~/ollm-cache/strict-write-test.sh` — expect turn1 `remembered`,
 a `blob published (atomic)` log line, turn2 recall `OMEGA-55`. If the
 backend was restarted, confirm `backend_sig` first: if it changed, expect a
