@@ -1,4 +1,4 @@
-# HANDOFF — oLLM (as of 2026-09-26, ~09:30 CEST)
+# HANDOFF — oLLM (as of 2026-09-26, ~20:00 CEST)
 
 For the next agent picking this up. Read me, then `README.md` (product spec),
 then `docs/design/README.md` (vendored deep design, historical framing).
@@ -51,10 +51,14 @@ handoff mirrors its latest state).
 
 ## Open work (priority order)
 
-1. **Forest v1** — the next build. **Speced evening 2026-09-25: see
+1. **Forest v1** — the next build. **E12 ran 2026-09-26 evening: ALL GATES
+   PASS** (see "E12 execution plan" section below for the result block +
+   the one caveat: first-request-after-restore re-prefills, warm it before
+   TTFT claims). The physics gate is cleared — forest-v1 + factory seed are
+   green-lit and building the forest is now the current task.
+   **Speced evening 2026-09-25: see
    "Forest-v1 decisions + gates" below — the testability refactor (T0/T1)
-   is DONE (2026-09-26, `c4ed07e`); the current task is running E12
-   (see "E12 execution plan" below), the physics gate the forest waits on.**
+   is DONE (2026-09-26, `c4ed07e`).**
    Today: per-session blobs only. Target:
    prefix trees, longest-prefix-match at admission, leaf-first LRU eviction,
    promote hot spans to shared trunks. Key scheme already designed:
@@ -206,7 +210,32 @@ says). Once both pass on the shipping model/config, freeze responses as
 golden fixtures; the fake replays them and CI never needs the box again
 until `backend_sig` rotates — test schedule mirrors compat-key schedule.
 
-### E12 execution plan (decided 2026-09-26, Rain — CURRENT TASK)
+### E12 execution plan (decided 2026-09-26, Rain — **EXECUTED 2026-09-26 evening, ALL GATES PASS**)
+
+**RESULT (run 19:39–19:58 CEST, full log `~/ollm-cache/e12/runlog.md`):**
+boundary restore is **byte-exact on the hybrid**. All arms token-identical:
+in-process cold-vs-warm (4/4), split-vs-monolithic companion, post-restart
+server restore (4/4 + bare continuation), and **MTP-on restored-vs-greedy**
+— recurrent-state rewind under speculative rollback is sound. Blob-size hard
+gate: seed-save MTP-off vs MTP-on **identical size AND identical sha256**
+(`bd112843…`, 185,327,496 B) — the draft model is NOT serialized into slot
+blobs; no separate blob lineage for spec-vs-greedy. E7 chunk-boundary prefix
+sharing re-established free on b10664 (cached_tokens=811 hits). Timings:
+save 19–54 ms, restore 14–18 ms, MTP ~2.2x faster decode than greedy at
+same bytes. **Caveat (finding, logged in runlog): the FIRST request after a
+restore does a full re-prefill** (prompt_ms≈2.46 s, cached=0); from the
+second request the KV serves prefix hits (~330 ms). Correctness unaffected —
+plan a warmup poke after restore before measuring TTFT; relevant to E9 + the
+flash-image story. **Forest-v1 + factory seed: GREEN-LIT.**
+Rain's amendment this run: prod :1245 was shut down for the test window
+(bot offline ~20 min) — restored via start-backend.sh + start-stack.sh,
+strict-write-test re-verified (OMEGA-55), sig unchanged.
+Fixtures frozen at `~/ollm-cache/e12/fixtures/a67e59194299/` (seed.bin,
+cold.jsonl, warm.jsonl, mtp_on.jsonl, seed.sha256). Driver fixes applied
+in-place: `/tokenize` needed `urllib.request.Request`; `cold_slots` extended
+to 4 entries.
+
+The original plan follows, kept as the record of what was decided:
 
 The next session's job is running E12. Everything below is settled; do not
 re-litigate, extend by amendment.
