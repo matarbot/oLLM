@@ -1,4 +1,4 @@
-# HANDOFF — oLLM (as of 2026-09-25, ~18:00 CEST)
+# HANDOFF — oLLM (as of 2026-09-26, ~09:30 CEST)
 
 For the next agent picking this up. Read me, then `README.md` (product spec),
 then `docs/design/README.md` (vendored deep design, historical framing).
@@ -18,10 +18,16 @@ handoff mirrors its latest state).
   (start-stack also starts the backend if down; logs `~/ollm-cache/ollm.log`).
   `backend_sig=a67e59194299` — blobs in cache are keyed with this; it changes
   if the backend's model/config fingerprint changes (by design: stale blobs go inert).
-- repo `~/source/oLLM`, remote `github.com/matarbot/oLLM`, main `c068e09`,
-  clean tree. Since 2026-09-26: `src/main.rs` split into `src/lib.rs` (app +
-  `pub mod backend` / `seed`) + 15-line `main`; `trait Backend` + scripted
-  fake + 7 protocol tests. Edition 2024, zero `unsafe`.
+- repo `~/source/oLLM`, remote `github.com/matarbot/oLLM`, main `c4ed07e`
+  (T0/T1 refactor, pushed 2026-09-26), clean tree. `src/main.rs` split into
+  `src/lib.rs` (app + `pub mod backend` / `seed`) + 17-line thin `main`;
+  `src/backend.rs` (trait Backend + LlamaBackend), `src/fake.rs`, `src/seed.rs`
+  (seed dance, unwired — E12 gate), 7 protocol tests. Edition 2024, zero
+  `unsafe`. The running proxy (`:1247`) runs the NEW build (restarted
+  2026-09-26 after the refactor; strict-write-test re-verified).
+- Live backend note (2026-09-26, Matar's probe): `:1245` now runs with
+  `--slot-save-path /home/rain/ollm-cache/slots` — save/restore is available
+  on prod directly (old notes saying otherwise are stale).
 - cache dir `~/ollm-cache/slots` (~1.3 GB, 9 blobs), cap `OLLM_CACHE_LIMIT_MB=2048`.
 
 ## What is DONE and verified (don't redo)
@@ -46,8 +52,10 @@ handoff mirrors its latest state).
 ## Open work (priority order)
 
 1. **Forest v1** — the next build. **Speced evening 2026-09-25: see
-   "Forest-v1 decisions + gates" below — first build item is the testability
-   refactor, and E12 is the physics gate the forest waits on.** Today: per-session blobs only. Target:
+   "Forest-v1 decisions + gates" below — the testability refactor (T0/T1)
+   is DONE (2026-09-26, `c4ed07e`); the current task is running E12
+   (see "E12 execution plan" below), the physics gate the forest waits on.**
+   Today: per-session blobs only. Target:
    prefix trees, longest-prefix-match at admission, leaf-first LRU eviction,
    promote hot spans to shared trunks. Key scheme already designed:
    `docs/design/design.md` §3 (chained hashes, root=compat_key). Hybrid
@@ -179,12 +187,97 @@ Fork-at-boundary equivalence on the hybrid (Qwen3.8-27B IQ4_XS, box0):
    draft-mtp`, so a divergence with MTP on is ambiguous (restore vs. spec
    path). Only after greedy arms are byte-identical, optionally re-run with
    MTP on to characterize the spec path separately.
+   (Matar addendum 2026-09-26, confirmed via relay): the MTP-on re-run is
+   not just speed characterization — it is the DIRECT test of recurrent-state
+   rewind under speculative rollback. On the hybrid, the target verifies k
+   draft tokens in one forward pass, folding the GDN recurrent state forward
+   across all k; on rejection it must rewind to exactly the last accepted
+   token (KV truncates trivially, recurrent rewind needs checkpoint machinery
+   in the unified cache). If greedy passes and MTP-on diverges, the diagnosis
+   is the spec rewind, immediately and specifically. Companion check:
+   blob-size comparison must be seed-save vs seed-save (n_predict=0) with MTP
+   toggled, same prompt + slot config, or sizes aren't comparable; if sizes
+   are equal, grep the blob header for a draft identifier if the format
+   exposes one.
 Companion cheap test (same session decision): seed/cold equality —
 split-prefill (system-only, then full) vs monolithic, same continuation,
 temp 0 → identical bytes (proves `n_predict=0` saves land where the template
 says). Once both pass on the shipping model/config, freeze responses as
 golden fixtures; the fake replays them and CI never needs the box again
 until `backend_sig` rotates — test schedule mirrors compat-key schedule.
+
+### E12 execution plan (decided 2026-09-26, Rain — CURRENT TASK)
+
+The next session's job is running E12. Everything below is settled; do not
+re-litigate, extend by amendment.
+
+- **Side-port server, never the prod one.** Rain's decision: E12 runs on a
+  SECOND llama-server on **port 1246** (the scaffold convention). `:1245`
+  (prod, serving the box0 bot + oLLM proxy) is NOT touched — no restart
+  window, no save/restore of the bot's own conversation slot, no stranded
+  bot. For different configurations: **shut down the test server and relaunch
+  it with the new flags** (Rain's instruction) — never two test configs at
+  once.
+- **Test server = prod flags minus MTP** for the greedy arms:
+  `--model /home/rain/models/lucebox-qwen/Qwen3.8-27B-UD-IQ4_XS.gguf
+  --alias qwen3.8 --port 1246 --ctx-size 786432 --parallel 3
+  --n-gpu-layers -1 --cache-type-k q8_0 --cache-type-v q8_0
+  --cache-ram 32768 --api-key "$(cat ~/ollm-cache/.backend_key)"
+  --flash-attn on --slot-save-path /home/rain/ollm-cache/e12/slots`
+  (NO `--spec-type draft-mtp` / no draft model). Optional MTP-on re-run:
+  relaunch the test server WITH the two MTP flags (`--spec-type draft-mtp
+  --spec-draft-model /home/rain/models/qwen3.8-27b/MTP/mtp-Qwen3.8-27B-Q4_0.gguf
+  --spec-draft-n-max 3`). Run inside `llama-rocm2` via `podman exec -d` with
+  the redirect INSIDE the container's shell (Pitfalls).
+- **Memory check first**: 128 GiB UMA, ~41 GiB available as of 2026-09-26
+  morning; a second 27B IQ4_XS instance needs ~16 GiB + ctx. Check
+  `free -g` before launching the test server; if it doesn't fit, E12 waits —
+  do not evict prod.
+- **Gates, in order** (all on the test server):
+  1. **Blob-size check (hard gate, from Matar 2026-09-26)**: seed-save
+     (`n_predict=0`) with MTP-OFF vs seed-save with MTP-ON, same prompt +
+     slot config. Identical sizes ⇒ blob layout is invariant to the spec
+     flag (confirms "draft not in blob"); MTP-on larger ⇒ draft IS folded in,
+     the Q3 reasoning is wrong, re-plan the MTP-on arm. If equal, grep the
+     blob header for a draft identifier if the format exposes one.
+  2. **Greedy E12 proper** (T3 steps 1–4, MTP off): seed prefill → save;
+     cold arm (fresh slots, 3 divergent user msgs, temp 0); warm arm
+     (restart test server, restore seed blob, same 3 continuations);
+     token-level diff.
+  3. **Companion split-vs-monolithic test** (cheap, same session).
+  4. **Optional MTP-on re-run**: the direct test of recurrent-state rewind
+     under speculative rollback (see Matar addendum above).
+  5. **Freeze golden fixtures** to `~/ollm-cache/e12/fixtures/a67e59194299/`
+     (Rain-confirmed path convention: `fixtures/<backend_sig>/{seed.bin,
+     cold.jsonl, warm.jsonl}`), box0-owned; pxl consumes, never writes.
+- **Slot mechanics** (Matar 2026-09-26, grounded): reuse is the unified RAM
+  prompt cache (block-aligned prefix match), no pinning; after a test-server
+  restart the next request is a full cold prefill unless a disk restore
+  serves it. Save/restore route is `/slots/{id}?action=save|restore`
+  (E1-verified; singular `/slot/` 404s). Re-read `/slots` immediately before
+  any save and identify slots by token count, never by remembered number.
+  If a restored slot's KV doesn't prefix-match a fresh request (conv-UUID
+  reset), `timings.prompt_ms` disambiguates: hundreds of ms = hit, minutes =
+  reset-and-prefill.
+- **Blob math for the bot's own ~99k conversation** (extrapolation from E1's
+  16 ms/153 MB, ~34 KB/tok): ≈ 3.5 GB, save ~0.5 s, restore ~0.3 s. Only
+  relevant if we ever revisit saving the prod conversation slot — the
+  side-port decision makes this unnecessary.
+- **What a divergence means**: identical ⇒ boundary restore is safe, forest
+  + factory seed green-lit. Divergent ⇒ record exactly where (first divergent
+  token index, which arm, greedy vs MTP-on) — that is the finding, not a
+  failure of the run.
+- **E7 note**: chunk-boundary RAM sharing was verified on build b10627;
+  current build is b10664 (`e70802a01`). E7 does NOT carry over
+  automatically (build_sig is deliberately NOT in oLLM's backend_sig — the
+  sig covers model_path/total_slots/n_ctx/chat_template/add_bos_token/
+  bos_token only) — the in-process arm of E12 on b10664 re-establishes it
+  essentially free.
+- **Relay status**: as of 2026-09-26 ~09:30 the relay delivers bot-to-bot
+  replies into Matar's open Bot Chat (in-turn delivery), not into our
+  `replies/` waiter — Matar's E12 answers arrived manually. Don't burn time
+  re-deriving this; if the relay is still misbehaving, check Desktop cookie
+  state (skill pitfall).
 
 ## Pitfalls (learned the expensive way — all live)
 
@@ -239,6 +332,8 @@ until `backend_sig` rotates — test schedule mirrors compat-key schedule.
 | tests | box0 `~/ollm-cache/{smoke,strict-write-test,stream-test,persistence-proof}.sh` |
 | proxy log | box0 `~/ollm-cache/ollm.log` |
 | cache blobs | box0 `~/ollm-cache/slots/*.bin` |
+| E12 (test server slots + fixtures) | box0 `~/ollm-cache/e12/{slots,fixtures/<backend_sig>}` |
+| E1 assets (reusable seed prompts) | box0 `~/ollm-cache/e1/` (e1.py, runlog.md) |
 | C++ base (upstream clone @ running build) | box0 `~/source/llama-cpp-upstream` branch `running-build` = `e70802a01` |
 | capacity ladder | pxl `~/projects/box0/sustained-agent-ladder.md` + `ladder.jsonl` |
 | running design log | deep-memory `projects/ollm-proxy.md` |
