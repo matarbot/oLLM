@@ -91,6 +91,13 @@ fix failure or a fix pass:
   prefix. Keep option sets uniform across seed/replay paths, or key cache blobs
   on the effective option set, not just model/signature.
 
+## Adoption note
+
+Nothing consumes oLLM in production (status 2026-09-29): the :1245/:1247 stack is
+live dev/test. Adopting the patched backend is therefore an ordinary restart with
+a new binary, not a gated cutover - and the proxy sidecar lifecycle change can
+land in parallel rather than as a prerequisite.
+
 ## Where to look
 
 - Fork branch: `matarbot/llama.cpp` `ckpt-persist` (three commits, tests first).
