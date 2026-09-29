@@ -376,3 +376,13 @@ restart via `start-stack.sh`, then
 a `blob published (atomic)` log line, turn2 recall `OMEGA-55`. If the
 backend was restarted, confirm `backend_sig` first: if it changed, expect a
 cold prefill on turn 1 (correct behavior, not a bug).
+
+## E12h - checkpoint-persist SILICON VERIFIED (2026-09-29, patched HIP build gfx1151)
+
+Branch `ckpt-persist` (rebased onto origin/master 6a2743f02) on :1246, prod stopped ~20 min.
+- seed: native /completions, raw TRUNK 22018 tok, slot 0, save seedh.bin 924 MB + sidecar .ckpt 313 MB.
+- fresh restart; restore slot 0: 2 checkpoints replayed from sidecar, 118 ms.
+- warm1 (FIRST request after restore, native endpoint, id_slot=0 in BODY): prompt_n=17, prompt_ms=318 - entire prefix served from restored checkpoint. cold virgin slot: prompt_n=22035, 63 s. Content temp-0 byte-identical (TIDEGLASS-9). 63 s -> 0.3 s.
+- e12g earlier "still re-prefills" was a HARNESS artifact: /v1/chat/completions dropped query-param id_slot (unpinned -> virgin slot full prefill) AND seed-vs-warm template options forked the token stream at tok 9 (reasoning_effort). e12h fixes both; driver at ~/ollm-cache/e12/e12h.py.
+- CPU CI-equivalent suite on rebased branch: 391 passed / 5 skipped / 0 failed.
+- PR: Rain opens manually (upstream AGENTS.md forbids agent-authored PR text). Fact sheet only.
