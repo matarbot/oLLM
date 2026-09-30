@@ -274,42 +274,49 @@ impl App {
     }
 
     /// Byte-capped LRU eviction by mtime; 60 s grace for writes in flight.
+    /// Thin IO glue around the pure `plan_evictions`: scan every regular file
+    /// in the cache dir (blobs, sidecars, scratch leftovers — REVIEW-2026-09-30
+    /// #1: *.bin-only accounting left sidecars invisible so the LRU never
+    /// fired over-limit), plan the deletions, execute them.
     async fn enforce_limit(&self) {
         let limit = self.cfg.cache_limit_mb * 1024 * 1024;
         let dir = self.cfg.cache_dir.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let mut files: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+            let mut entries: Vec<CacheEntry> = Vec::new();
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for e in rd.flatten() {
                     let p = e.path();
-                    if p.extension().and_then(|x| x.to_str()) != Some("bin") {
+                    if !p.is_file() {
                         continue;
                     }
-                    if let Ok(md) = e.metadata() {
-                        files.push((p, md.modified().unwrap_or(SystemTime::UNIX_EPOCH), md.len()));
-                    }
+                    let Ok(md) = e.metadata() else { continue };
+                    let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+                    let mtime = md
+                        .modified()
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    entries.push(CacheEntry {
+                        name: name.to_string(),
+                        len: md.len(),
+                        mtime_unix: mtime,
+                    });
                 }
             }
-            let total: u64 = files.iter().map(|f| f.2).sum();
-            if total <= limit {
-                return;
-            }
-            files.sort_by_key(|f| f.1);
-            let now = SystemTime::now();
-            let mut freed = 0u64;
-            for (p, at, len) in files {
-                if total - freed <= limit {
-                    break;
-                }
-                if now.duration_since(at).map(|d| d.as_secs() < 60).unwrap_or(false) {
-                    continue; // grace: just written/served
-                }
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for name in plan_evictions(&entries, limit, now, 60) {
+                let p = dir.join(&name);
+                let len = entries
+                    .iter()
+                    .find(|e| e.name == name)
+                    .map(|e| e.len)
+                    .unwrap_or(0);
                 match std::fs::remove_file(&p) {
                     Ok(()) => {
-                        freed += len;
-                        // delete the sidecar with its blob — the scan
-                        // only counts .bin, orphans would accumulate forever
-                        let _ = std::fs::remove_file(&sidecar_path(&p));
                         tracing::info!(file = %p.display(), mib = len / 1024 / 1024, "evicted (LRU)");
                     }
                     Err(e) => {
@@ -961,6 +968,8 @@ mod tests {
                    session_key(&h, &t2, "x-session-id"));
     }
 
+}
+
 // ------------------------------------------------------------------ quota
 // Disk-quota planner (P0, REVIEW-2026-09-30 #1). Live measurement: /health
 // reported cache_mb 2878 vs limit 2048 while the LRU never fired, because
@@ -976,15 +985,21 @@ pub struct CacheEntry {
     pub mtime_unix: u64,
 }
 
-/// Quota usage. BUGGY PORT (pre-fix): counts *.bin blobs only — this is the
-/// P0 defect; sidecars and scratch leftovers are real disk but uncounted.
+/// Quota usage: every regular file in the cache dir counts — blobs (.bin),
+/// sidecars (.ckpt), scratch leftovers (.save/.save.ckpt). REVIEW-2026-09-30
+/// #1: *.bin-only counting left sidecars (measured 72% of cache bytes)
+/// invisible, so an over-limit cache never evicted.
 pub fn cache_usage_bytes(entries: &[CacheEntry]) -> u64 {
-    entries.iter().filter(|e| e.name.ends_with(".bin")).map(|e| e.len).sum()
+    entries.iter().map(|e| e.len).sum()
 }
 
-/// Plan evictions. BUGGY PORT (pre-fix): candidates are *.bin blobs only,
-/// usage is *.bin-only, no orphan/scratch sweep. Faithful to the old inline
-/// enforce_limit so the tests below reproduce the measured failure.
+/// Pure eviction plan, in deletion order:
+///   1. orphan sidecars + scratch leftovers — free bytes with no live session
+///      state behind them (base blob gone, or no .bin at all, e.g. .save);
+///   2. blob + sidecar pairs together, oldest first (pair mtime = max of the
+///      two files — a .ckpt is only meaningful beside its .bin).
+/// A file (or pair) touched within `grace_secs` of `now_unix` is skipped
+/// (writes in flight). Stops as soon as projected usage <= limit.
 pub fn plan_evictions(
     entries: &[CacheEntry],
     limit_bytes: u64,
@@ -995,24 +1010,66 @@ pub fn plan_evictions(
     if total <= limit_bytes {
         return Vec::new();
     }
-    let mut blobs: Vec<&CacheEntry> =
-        entries.iter().filter(|e| e.name.ends_with(".bin")).collect();
-    blobs.sort_by_key(|e| e.mtime_unix);
+    let names: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.name.as_str()).collect();
     let mut plan = Vec::new();
     let mut freed = 0u64;
-    for b in blobs {
+    // Pass 1: orphans + scratch (nothing live behind the name).
+    let mut junk: Vec<&CacheEntry> = entries
+        .iter()
+        .filter(|e| {
+            if e.name.ends_with(".bin") {
+                return false;
+            }
+            if e.name.ends_with(".ckpt") {
+                // sidecar: junk only when its base blob is gone
+                !names.contains(e.name.strip_suffix(".ckpt").unwrap_or(""))
+            } else {
+                true // .save / anything else: scratch leftover
+            }
+        })
+        .collect();
+    junk.sort_by_key(|e| e.mtime_unix);
+    for e in junk {
         if total - freed <= limit_bytes {
             break;
         }
-        if now_unix.saturating_sub(b.mtime_unix) < grace_secs {
-            continue; // grace: just written/served
+        if now_unix.saturating_sub(e.mtime_unix) < grace_secs {
+            continue; // grace: just written
         }
-        plan.push(b.name.clone());
-        let sc_name = format!("{}.ckpt", b.name);
-        if let Some(sc) = entries.iter().find(|e| e.name == sc_name) {
-            plan.push(sc.name.clone()); // sidecar rides its blob
+        plan.push(e.name.clone());
+        freed += e.len;
+    }
+    // Pass 2: blob+sidecar pairs, oldest first.
+    let mut pairs: Vec<(u64, Vec<String>)> = entries
+        .iter()
+        .filter(|e| e.name.ends_with(".bin"))
+        .map(|b| {
+            let sc_name = b.name.clone() + ".ckpt";
+            let sidecar = entries.iter().find(|e| e.name == sc_name);
+            let mtime = b
+                .mtime_unix
+                .max(sidecar.map(|s| s.mtime_unix).unwrap_or(0));
+            let mut unit = vec![b.name.clone()];
+            if let Some(s) = sidecar {
+                unit.push(s.name.clone()); // never orphan the sidecar
+            }
+            (mtime, unit)
+        })
+        .collect();
+    pairs.sort_by_key(|p| p.0);
+    for (mtime, unit) in pairs {
+        if total - freed <= limit_bytes {
+            break;
         }
-        freed += b.len;
+        if now_unix.saturating_sub(mtime) < grace_secs {
+            continue; // grace: pair just written/served
+        }
+        freed += unit
+            .iter()
+            .map(|n| entries.iter().find(|e| &e.name == n).unwrap().len)
+            .sum::<u64>();
+        plan.extend(unit);
     }
     plan
 }
@@ -1128,4 +1185,4 @@ mod quota_tests {
     }
 }
 
-}
+
