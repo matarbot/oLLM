@@ -121,9 +121,17 @@ pub fn session_key(headers: &HeaderMap, body: &Value, header_name: &str) -> Stri
             return format!("hdr-{}", sanitize(v));
         }
     }
+    // Fallback for header-less clients (Hermes, curl, any OpenAI host):
+    // hash the system message ONLY. Hermes keeps its system prompt
+    // byte-stable for the life of a conversation (its caching invariant),
+    // so every turn of one conversation — and any cancelled-then-retried
+    // request — maps to the same session and can reuse the KV blob.
+    // Hashing all messages (the old behavior) made every turn a new
+    // session: restore could never fire. Distinct conversations differ in
+    // system prompt (cwd, memory, date) and stay isolated.
     let mut h = Sha256::new();
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
-        for m in msgs {
+        for m in msgs.iter().filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system")) {
             h.update(serde_json::to_vec(m).unwrap_or_default());
             h.update([0u8]);
         }
