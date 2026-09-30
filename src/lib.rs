@@ -960,4 +960,172 @@ mod tests {
         assert_eq!(session_key(&h, &t1, "x-session-id"),
                    session_key(&h, &t2, "x-session-id"));
     }
+
+// ------------------------------------------------------------------ quota
+// Disk-quota planner (P0, REVIEW-2026-09-30 #1). Live measurement: /health
+// reported cache_mb 2878 vs limit 2048 while the LRU never fired, because
+// usage was counted over *.bin only and *.bin.ckpt sidecars were invisible.
+// The planner is pure (entries + limit + now + grace -> names to delete):
+// no fs, no run-date.
+
+/// One cache-dir file as seen by the quota planner (name, size, mtime).
+#[derive(Clone, Debug)]
+pub struct CacheEntry {
+    pub name: String,
+    pub len: u64,
+    pub mtime_unix: u64,
+}
+
+/// Quota usage. BUGGY PORT (pre-fix): counts *.bin blobs only — this is the
+/// P0 defect; sidecars and scratch leftovers are real disk but uncounted.
+pub fn cache_usage_bytes(entries: &[CacheEntry]) -> u64 {
+    entries.iter().filter(|e| e.name.ends_with(".bin")).map(|e| e.len).sum()
+}
+
+/// Plan evictions. BUGGY PORT (pre-fix): candidates are *.bin blobs only,
+/// usage is *.bin-only, no orphan/scratch sweep. Faithful to the old inline
+/// enforce_limit so the tests below reproduce the measured failure.
+pub fn plan_evictions(
+    entries: &[CacheEntry],
+    limit_bytes: u64,
+    now_unix: u64,
+    grace_secs: u64,
+) -> Vec<String> {
+    let total = cache_usage_bytes(entries);
+    if total <= limit_bytes {
+        return Vec::new();
+    }
+    let mut blobs: Vec<&CacheEntry> =
+        entries.iter().filter(|e| e.name.ends_with(".bin")).collect();
+    blobs.sort_by_key(|e| e.mtime_unix);
+    let mut plan = Vec::new();
+    let mut freed = 0u64;
+    for b in blobs {
+        if total - freed <= limit_bytes {
+            break;
+        }
+        if now_unix.saturating_sub(b.mtime_unix) < grace_secs {
+            continue; // grace: just written/served
+        }
+        plan.push(b.name.clone());
+        let sc_name = format!("{}.ckpt", b.name);
+        if let Some(sc) = entries.iter().find(|e| e.name == sc_name) {
+            plan.push(sc.name.clone()); // sidecar rides its blob
+        }
+        freed += b.len;
+    }
+    plan
+}
+
+#[cfg(test)]
+mod quota_tests {
+    //! Pure quota planner: every regular file counts toward usage (blobs,
+    //! sidecars, scratch leftovers); eviction unit = blob + sidecar together;
+    //! mtime-LRU, 60 s grace, stop at the limit. No fs, no run-date.
+    use super::*;
+
+    fn e(name: &str, len: u64, mtime: u64) -> CacheEntry {
+        CacheEntry { name: name.into(), len, mtime_unix: mtime }
+    }
+
+    fn deleted_bytes(plan: &[String], entries: &[CacheEntry]) -> u64 {
+        plan.iter()
+            .map(|f| entries.iter().find(|x| &x.name == f).unwrap().len)
+            .sum()
+    }
+
+    #[test]
+    fn sidecars_count_toward_usage() {
+        // The exact measured regression: blobs alone (802 MiB) fit under the
+        // 2048 MiB limit, but sidecars (2076 MiB) push real usage to 2878 MiB.
+        // Under the old *.bin-only scan the LRU never fired.
+        let entries = vec![
+            e("s1__abc.bin", 280_486_460, 1_000),
+            e("s1__abc.bin.ckpt", 668_753_148, 1_000),
+            e("s2__abc.bin", 280_486_460, 2_000),
+            e("s2__abc.bin.ckpt", 668_753_148, 2_000),
+            e("s3__abc.bin", 280_242_552, 3_000),
+            e("s3__abc.bin.ckpt", 839_655_612, 3_000),
+        ];
+        let limit = 2048u64 * 1024 * 1024;
+        let total = cache_usage_bytes(&entries);
+        assert!(total > limit, "sidecar bytes must count toward usage");
+        assert_eq!(total, 3_018_377_380);
+        let plan = plan_evictions(&entries, limit, 3_600, 60);
+        assert!(!plan.is_empty(), "over-limit cache must plan deletions");
+        // No sidecar may be deleted without its blob (never orphan).
+        let set: std::collections::HashSet<&str> =
+            plan.iter().map(|s| s.as_str()).collect();
+        for f in &plan {
+            if let Some(base) = f.strip_suffix(".ckpt") {
+                assert!(set.contains(base), "sidecar deleted without its blob: {f}");
+            }
+        }
+        let deleted = deleted_bytes(&plan, &entries);
+        assert!(total - deleted <= limit, "plan must bring usage <= limit");
+    }
+
+    #[test]
+    fn pairs_evicted_together_in_mtime_order() {
+        let entries = vec![
+            e("old__x.bin", 100, 1_000),
+            e("old__x.bin.ckpt", 900, 1_000),
+            e("mid__x.bin", 100, 2_000),
+            e("mid__x.bin.ckpt", 900, 2_000),
+        ];
+        let limit = 1_000u64; // total 2000
+        let plan = plan_evictions(&entries, limit, 3_600, 60);
+        assert_eq!(
+            plan,
+            vec!["old__x.bin".to_string(), "old__x.bin.ckpt".to_string()],
+            "oldest pair evicted first, blob + sidecar together, nothing else"
+        );
+    }
+
+    #[test]
+    fn orphan_sidecars_swept_when_base_blob_gone() {
+        // A sidecar whose .bin is gone is pure junk: counted AND swept
+        // (older than grace) before touching live pairs.
+        let entries = vec![
+            e("a__x.bin", 900, 1_000),
+            e("a__x.bin.ckpt", 900, 1_000),
+            e("gone__x.bin.ckpt", 1_000, 1_000), // orphan
+        ];
+        let limit = 1_500u64; // total 2800
+        let plan = plan_evictions(&entries, limit, 3_600, 60);
+        assert!(plan.contains(&"gone__x.bin.ckpt".to_string()),
+                "orphan sidecar must be swept: {plan:?}");
+        assert!(plan.contains(&"a__x.bin".to_string()));
+        let deleted = deleted_bytes(&plan, &entries);
+        assert!(2_800 - deleted <= limit);
+    }
+
+    #[test]
+    fn grace_honored() {
+        // Everything within the 60 s grace -> nothing deleted, even far
+        // over limit.
+        let entries = vec![
+            e("hot__x.bin", 5_000, 9_500),
+            e("hot__x.bin.ckpt", 5_000, 9_501),
+        ];
+        let plan = plan_evictions(&entries, 1_000, 9_530, 60);
+        assert!(plan.is_empty(), "grace must protect fresh writes: {plan:?}");
+    }
+
+    #[test]
+    fn no_over_eviction() {
+        // The oldest pair alone brings usage to the limit -> stop there.
+        let entries = vec![
+            e("o1__x.bin", 100, 1_000),
+            e("o1__x.bin.ckpt", 900, 1_000),
+            e("o2__x.bin", 100, 2_000),
+            e("o2__x.bin.ckpt", 900, 2_000),
+        ];
+        let limit = 1_000u64; // total 2000; dropping pair1 (1000) hits the limit
+        let plan = plan_evictions(&entries, limit, 3_600, 60);
+        let deleted = deleted_bytes(&plan, &entries);
+        assert_eq!(deleted, 1_000, "stop as soon as projected usage <= limit: {plan:?}");
+    }
+}
+
 }
