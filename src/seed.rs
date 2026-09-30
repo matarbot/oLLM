@@ -335,6 +335,31 @@ mod tests {
     use crate::backend::SlotState;
     use crate::fake::{Call, FakeBackend};
 
+    #[test]
+    fn fs_publisher_moves_sidecar_with_blob() {
+        //! ckpt-persist: llama.cpp writes '<scratch>.ckpt' beside the
+        //! scratch blob; publish renames the blob, so the sidecar must ride
+        //! along or the published blob can never restore fast (and the
+        //! orphaned sidecar leaks disk). Pure fs, no backend, no run-date.
+        let dir = std::env::temp_dir().join(format!("ollm-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir); // clean slate for crashed runs
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("sys.save"), b"kv").unwrap();
+        std::fs::write(dir.join("sys.save.ckpt"), b"ckpts").unwrap();
+
+        let pub_ = super::FsPublisher::new(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(pub_.publish("sys.save", "sys.bin")).unwrap();
+
+        assert!(dir.join("sys.bin").exists(), "blob published");
+        assert!(!dir.join("sys.save").exists(), "scratch consumed");
+        assert!(dir.join("sys.bin.ckpt").exists(), "sidecar published with blob");
+        assert!(!dir.join("sys.save.ckpt").exists(), "sidecar scratch consumed");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn idle_slot(id: u32) -> SlotState {
         SlotState { id, is_processing: false, n_tokens: 0 }
     }
