@@ -299,6 +299,9 @@ impl App {
                 match std::fs::remove_file(&p) {
                     Ok(()) => {
                         freed += len;
+                        // delete the sidecar with its blob — the scan
+                        // only counts .bin, orphans would accumulate forever
+                        let _ = std::fs::remove_file(&sidecar_path(&p));
                         tracing::info!(file = %p.display(), mib = len / 1024 / 1024, "evicted (LRU)");
                     }
                     Err(e) => {
@@ -335,6 +338,7 @@ impl App {
             let f = std::fs::File::open(&scratch_path)?; // llama.cpp closed it
             f.sync_all()?; // durability before visibility
             std::fs::rename(&scratch_path, &final_path)?; // atomic publish
+            rename_sidecar(&scratch_path, &final_path); // ckpt rides along
             if let Some(parent) = final_path.parent() {
                 if let Ok(d) = std::fs::File::open(parent) {
                     let _ = d.sync_all(); // index durability
@@ -379,6 +383,28 @@ impl App {
 }
 
 // mtime bump — safe, no FFI ---------------------------------------------------
+
+/// ckpt-persist: llama.cpp writes '<blob>.ckpt' beside every saved blob —
+/// the checkpoint ledger that makes a restored slot trustworthy for prefix
+/// reuse (docs/design/checkpoint-persist.md). Any blob rename must carry
+/// the sidecar or the published blob loses fast-restore and the orphan
+/// leaks disk. Absence of a sidecar is normal (pre-persist backend) and
+/// never an error: restore then degrades to re-prefill, correctness intact.
+fn sidecar_path(blob: &std::path::Path) -> std::path::PathBuf {
+    let mut s = blob.as_os_str().to_os_string();
+    s.push(".ckpt");
+    std::path::PathBuf::from(s)
+}
+
+fn rename_sidecar(from: &std::path::Path, to: &std::path::Path) {
+    let src = sidecar_path(from);
+    if !src.exists() {
+        return; // no checkpoints (old backend / all-attention model)
+    }
+    if let Err(e) = std::fs::rename(&src, sidecar_path(to)) {
+        tracing::warn!(err = %e, "sidecar rename failed (restore degrades to re-prefill)");
+    }
+}
 
 /// Set a file's mtime (and atime) to now. Creates nothing: if the file
 /// vanished between save and touch, that is a benign race (blob gone = cold

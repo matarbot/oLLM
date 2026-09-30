@@ -81,6 +81,7 @@ impl Publisher for FsPublisher {
             f.sync_all().map_err(|e| format!("fsync {scratch}: {e}"))?;
             std::fs::rename(&scratch_path, &final_path)
                 .map_err(|e| format!("rename {scratch} -> {final_name}: {e}"))?;
+            crate::rename_sidecar(&scratch_path, &final_path); // ckpt rides along
             if let Some(parent) = final_path.parent() {
                 if let Ok(d) = std::fs::File::open(parent) {
                     let _ = d.sync_all(); // index durability
