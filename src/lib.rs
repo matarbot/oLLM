@@ -747,3 +747,61 @@ pub async fn serve(cfg: Config) -> anyhow::Result<()> {
     axum::serve(listener, router).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! session identity: header first, then system-prompt-only fallback
+    //! (Hermes stickiness). No fs, no network, no run-date.
+
+    use super::*;
+
+    #[test]
+    fn header_session_wins_and_is_stable() {
+        let body = serde_json::json!({"messages": [
+            {"role": "user", "content": "hi"}]});
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-session-id", "abc".parse().unwrap());
+        assert_eq!(session_key(&h, &body, "x-session-id"),
+                   session_key(&h, &body, "x-session-id"));
+        assert!(session_key(&h, &body, "x-session-id").starts_with("hdr-"));
+    }
+
+    #[test]
+    fn fallback_hash_system_only_turns_stick() {
+        // same system prompt, different turns => SAME session key
+        let sys = serde_json::json!({"role": "system", "content": "you are stable."});
+        let t1 = serde_json::json!({"messages": [sys,
+            {"role": "user", "content": "turn one"}]});
+        let t2 = serde_json::json!({"messages": [sys,
+            {"role": "user", "content": "turn one"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "turn two, totally different"}]});
+        let h = axum::http::HeaderMap::new();
+        assert_eq!(session_key(&h, &t1, "x-session-id"),
+                   session_key(&h, &t2, "x-session-id"),
+                   "same conversation must stick to one session");
+    }
+
+    #[test]
+    fn fallback_isolates_different_system_prompts() {
+        let a = serde_json::json!({"messages": [
+            {"role": "system", "content": "conversation A context"},
+            {"role": "user", "content": "hi"}]});
+        let b = serde_json::json!({"messages": [
+            {"role": "system", "content": "conversation B context"},
+            {"role": "user", "content": "hi"}]});
+        let h = axum::http::HeaderMap::new();
+        assert_ne!(session_key(&h, &a, "x-session-id"),
+                   session_key(&h, &b, "x-session-id"),
+                   "different conversations must not share a session");
+    }
+
+    #[test]
+    fn anonymous_no_system_hashes_deterministically() {
+        let t1 = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let t2 = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let h = axum::http::HeaderMap::new();
+        assert_eq!(session_key(&h, &t1, "x-session-id"),
+                   session_key(&h, &t2, "x-session-id"));
+    }
+}
