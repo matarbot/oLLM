@@ -804,6 +804,140 @@ mod tests {
                    "different conversations must not share a session");
     }
 
+    #[tokio::test]
+    async fn abort_backend_on_client_disconnect() {
+        //! A hung-up client (Hermes steer) must release the backend NOW:
+        //! llama.cpp cancels generation on connection close. The unpatched
+        //! proxy keeps draining to persist KV -> zombies hold slots and
+        //! every steer queues behind a generation the user rejected.
+        use axum::extract::State;
+        use futures_util::StreamExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let saved = Arc::new(AtomicBool::new(false));
+
+        let (cl, sv) = (closed.clone(), saved.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let (cl, sv) = (cl.clone(), sv.clone());
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let hdr_end = loop {
+                            let Ok(n) = sock.read(&mut tmp).await else { return };
+                            if n == 0 { return } // idle keep-alive closed by pool
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break p + 4;
+                            }
+                        };
+                        let head = String::from_utf8_lossy(&buf[..hdr_end]).to_lowercase();
+                        let clen = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        while buf.len() < hdr_end + clen {
+                            let Ok(n) = sock.read(&mut tmp).await else { return };
+                            if n == 0 { return }
+                            buf.extend_from_slice(&tmp[..n]);
+                        }
+                        let line = String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == b'\r' || b == b'\n').unwrap_or(0)]).to_string();
+                        let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        buf.drain(..hdr_end + clen);
+
+                        if path.starts_with("/v1/chat/completions") {
+                            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").await.unwrap();
+                            let mut n = 0usize;
+                            loop {
+                                let data = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"tok{n} \"}}}}]}}\n\n");
+                                let framed = format!("{:x}\r\n{}\r\n", data.len(), data);
+                                if sock.write_all(framed.as_bytes()).await.is_err() {
+                                    cl.store(true, Ordering::Relaxed);
+                                    return;
+                                }
+                                n += 1;
+                                let mut one = [0u8; 1];
+                                tokio::select! {
+                                    r = sock.read(&mut one) => {
+                                        if matches!(r, Ok(0) | Err(_)) {
+                                            // peer hung up mid-generation
+                                            cl.store(true, Ordering::Relaxed);
+                                            return;
+                                        }
+                                    }
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => {}
+                                }
+                                if n > 5000 { return } // ~150s backstop (never hit in test)
+                            }
+                        } else if path.starts_with("/slots") && line.starts_with("POST") {
+                            saved_store(&sv, &mut sock).await;
+                        } else if path.starts_with("/slots") {
+                            let body = "[{\"id\":0,\"is_processing\":false,\"n_tokens\":0}]";
+                            let resp = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}", body.len(), body);
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        } else {
+                            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}").await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = Config {
+            backend: format!("http://{addr}"),
+            bind: String::new(),
+            cache_dir: std::env::temp_dir().join(format!("ollm-abort-{}", std::process::id())),
+            cache_limit_mb: 2048,
+            backend_api_key: None,
+            session_header: "x-session-id".to_string(),
+        };
+        let app = Arc::new(App {
+            cfg,
+            backend: LlamaBackend::new(format!("http://{addr}"), None, reqwest::Client::new()),
+            http: reqwest::Client::new(),
+            backend_sig: "test".to_string(),
+            slots: Mutex::new(HashMap::new()),
+            write_gate: RwLock::new(()),
+        });
+
+        let body = crate::Bytes(
+            "{\"messages\":[{\"role\":\"system\",\"content\":\"stable prompt\"},{\"role\":\"user\",\"content\":\"long task\"}],\"stream\":true,\"max_tokens\":2000,\"temperature\":0}".as_bytes().to_vec(),
+        );
+        let res = chat_completions(State(app), axum::http::HeaderMap::new(), body).await;
+        let mut stream = res.into_body().into_data_stream();
+        let mut got = 0usize;
+        while got < 2 {
+            if stream.next().await.is_some() {
+                got += 1;
+            }
+        }
+        drop(stream); // client hangs up (steer)
+
+        // patched: proxy closes the backend connection promptly -> EOF seen
+        for _ in 0..60 {
+            if closed.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(closed.load(Ordering::Relaxed), "proxy must close backend connection when client disconnects");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!saved.load(Ordering::Relaxed), "abandoned turn must not be saved (rejected text is not persisted)");
+    }
+
+    async fn saved_store(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>, sock: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncWriteExt;
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}").await;
+    }
+
     #[test]
     fn anonymous_no_system_hashes_deterministically() {
         let t1 = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
