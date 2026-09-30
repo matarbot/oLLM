@@ -557,11 +557,14 @@ async fn chat_completions(State(app): State<Arc<App>>, headers: HeaderMap, body:
                         }
                         total += b.len();
                         if tx.send(Ok(b)).await.is_err() {
-                            // Client hung up (ctrl-c, head -c, cancelled turn).
-                            // The backend keeps generating regardless — keep
-                            // draining so we can still persist the finished KV;
-                            // just stop forwarding (channel closed anyway).
+                            // Client hung up (steer, ctrl-c, cancelled turn).
+                            // Abort: stop draining and drop the backend
+                            // stream -> connection closes -> llama.cpp
+                            // cancels the generation and frees the slot.
+                            // Persisting a rejected turn was the old
+                            // behavior; it starves the steer that follows.
                             disconnected = true;
+                            break;
                         }
                     }
                     Err(e) => {
@@ -579,7 +582,7 @@ async fn chat_completions(State(app): State<Arc<App>>, headers: HeaderMap, body:
                 disconnected,
                 "stream pump finished"
             );
-            if !failed {
+            if !failed && !disconnected {
                 if let Some(id) = steer {
                     {
                         let mut g = app2.slots.lock().await;
@@ -589,6 +592,17 @@ async fn chat_completions(State(app): State<Arc<App>>, headers: HeaderMap, body:
                     }
                     app2.save_slot(id, &sess2).await;
                     app2.enforce_limit().await;
+                }
+            } else if disconnected {
+                if let Some(id) = steer {
+                    // abandoned turn: KV half-written and the user rejected
+                    // this continuation - do not publish it. Slot stays
+                    // unclaimed and stealable by the next admission.
+                    let mut g = app2.slots.lock().await;
+                    if let Some(s) = g.get_mut(&id) {
+                        s.dirty = false;
+                        s.session = None;
+                    }
                 }
             }
         });
