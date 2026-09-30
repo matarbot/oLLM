@@ -105,3 +105,27 @@ land in parallel rather than as a prerequisite.
   `runlog.md`.
 - Upstream context: issue #25913; guard added for rewindability in the
   checkpoints work (`--ctx-checkpoints`).
+
+## Measured: cache tiers are not interchangeable (2026-09-30)
+
+Live A/B on box0 with the parallel-similar harness (3 concurrent sessions,
+shared ~8k-token base, distinct tails, follow-up recall on all three):
+
+| config              | turn1 TTFT (cold x3) | turn2 TTFT (live follow-up x3) |
+|---------------------|----------------------|--------------------------------|
+| --cache-ram 32768   | 19-35 s              | 1.7 / 1.7 / 9.0 s            |
+| --cache-ram 0       | 10-32 s              | 8.9 / 11.0 / 23.8 s          |
+
+Findings:
+- --cache-ram 0 disables prompt reuse ENTIRELY, including a hot slot
+  reusing its own prefix. Every turn re-prefills. oLLM cannot compensate:
+  restore is skipped while a slot is hot (KV-authoritative rule), and the
+  backend wipes that KV anyway at budget 0.
+- The two tiers do different jobs. RAM tier = live-conversation reuse.
+  Disk forest = survival across restart, process loss, and slot-steal
+  (restore 124 ms for 22k tokens, E12h). Neither replaces the other.
+- First-round thundering herd is irreducible at any cache setting: three
+  identical prefixes arriving simultaneously each prefill (RAM cache serves
+  settled prefixes, not in-flight ones).
+- Decision: keep --cache-ram 32768. The 32 GB freed by 0 is not worth
+  turning every interactive turn into a cold prefill.
