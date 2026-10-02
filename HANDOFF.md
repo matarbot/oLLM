@@ -6,10 +6,10 @@ at this timestamp. Read top to bottom once; re-read Pitfalls before touching cod
 ## Live state (verified 2026-09-30)
 
 - **box0** (Strix Halo, 192.168.178.42, SSH from pxl open): prod stack runs inside
-  podman container `ollm-backend` (Up 4 days).
+  podman container `ollm-backend` (renamed from llama-rocm2 2026-10-02; image kyuz0/amd-strix-halo-toolboxes:rocm-7.14).
   - backend `:1245` = **our fork's patched HIP build**:
     `~/source/oLLM/vendor/llama.cpp/build-hip/bin/llama-server`
-    (branch `ckpt-persist`, tip `64dfa8058`, gfx1151). Flags: `--parallel 3
+    (branch `ckpt-persist`, tip `64dfa8058`, gfx1151 — vendored as submodule `vendor/llama.cpp`; rebuild via `~/ollm-cache/build-vendor-hip.sh`). Flags: `--parallel 3
     --ctx-size 786432 --cache-ram 32768 --slot-save-path
     /home/rain/ollm-cache/slots` + MTP draft.
   - proxy `:1247` = `~/source/oLLM` `target/debug/ollm`, bound 0.0.0.0,
