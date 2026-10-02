@@ -6,9 +6,9 @@ at this timestamp. Read top to bottom once; re-read Pitfalls before touching cod
 ## Live state (verified 2026-09-30)
 
 - **box0** (Strix Halo, 192.168.178.42, SSH from pxl open): prod stack runs inside
-  podman container `llama-rocm2` (Up 4 days).
+  podman container `ollm-backend` (Up 4 days).
   - backend `:1245` = **our fork's patched HIP build**:
-    `~/source/llama-cpp-upstream/build-hip/bin/llama-server`
+    `~/source/oLLM/vendor/llama.cpp/build-hip/bin/llama-server`
     (branch `ckpt-persist`, tip `64dfa8058`, gfx1151). Flags: `--parallel 3
     --ctx-size 786432 --cache-ram 32768 --slot-save-path
     /home/rain/ollm-cache/slots` + MTP draft.
@@ -88,7 +88,7 @@ in `docs/design/` as a PR-style proposal Rain can open.
 - **Tests never create repo folders**; suite convention is `./tmp` exists
   (CI provides). No Qwen3.8-27B downloads in tests; tinygemma3 is the suite's.
 - **box0 test servers on `:1246`**: kill by pattern `llama-server` inside
-  container (`podman exec llama-rocm2 pkill -f llama-server`) — it also kills
+  container (`podman exec ollm-backend pkill -f llama-server`) — it also kills
   prod `:1245`; that is fine ONLY because there are no prod consumers; announce
   it, don't let Rain's live session silently die mid-thrash.
 - **abort is per-connection**: llama.cpp cancels on HTTP disconnect; the proxy's
@@ -125,7 +125,7 @@ bash ~/ollm-cache/strict-write-test.sh            # expect recall OMEGA-55, blob
 python3 ~/ollm-cache/parallel_similar.py          # expect 3x cold TTFT ~10-35s
 python3 ~/ollm-cache/abort_live.py                # expect backend idle <2s after hangup
 ```
-Backend restart (~3 min): `podman exec llama-rocm2 pkill -9 -f llama-server;
+Backend restart (~3 min): `podman exec ollm-backend pkill -9 -f llama-server;
 cd ~/ollm-cache && bash start-backend.sh` (idempotent; health-polls itself).
 Scary-but-correct: sig changes on restart ⇒ every blob name mismatches ⇒ turn-1
 cold prefills everywhere. Delete stale blobs to clear, never "fix" by pinning sig.
@@ -135,7 +135,7 @@ cold prefills everywhere. Delete stale blobs to clear, never "fix" by pinning si
 | what | where |
 |---|---|
 | oLLM repo | box0 `~/source/oLLM` (remote matarbot/oLLM) |
-| llama.cpp fork work | box0 `~/source/llama-cpp-upstream`, branch `ckpt-persist`; pxl read-clone `~/source/llama-cpp-work` |
+| llama.cpp fork work | box0 `~/source/oLLM/vendor/llama.cpp`, branch `ckpt-persist`; pxl read-clone `~/source/llama-cpp-work` |
 | launch scripts | box0 `~/ollm-cache/start-backend.sh` `.sh.b10664`=pre-fork backup; `start-stack.sh` = proxy |
 | test drivers | box0 `~/ollm-cache/{parallel_similar,abort_live,strict-write-test,thrash}.*`, `~/ollm-cache/e12/` |
 | design corpus | `docs/design/` in oLLM repo |
