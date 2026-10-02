@@ -123,11 +123,11 @@ instead. See `docs/design/README.md` for its own reading order.
 
 ## Repo scripts
 
-- `smoke.sh` — round-trip + recall through the proxy
-- `persistence-proof.sh` — kill backend hard, restore, recall
-- `stream-test.sh` — streaming round-trip + disconnect behavior
-- `start-stack.sh` / `start-backend.sh` — box0 experiment harness (container + server + proxy)
-- `strict-write-test.sh` — invariants 1–4 end-to-end
+- `tests/live/smoke.sh` — round-trip + recall through the proxy
+- `tests/live/persistence-proof.sh` — kill backend hard, restore, recall
+- `tests/live/stream-test.sh` — streaming round-trip + disconnect behavior
+- `ops/start-stack.sh` / `ops/start-backend.sh` / `ops/stop-stack.sh` — bring the box0 stack up/down (container + vendored server + proxy)
+- `tests/live/strict-write-test.sh` — invariants 1–4 end-to-end
 
 ## License
 

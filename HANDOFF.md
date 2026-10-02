@@ -9,7 +9,7 @@ at this timestamp. Read top to bottom once; re-read Pitfalls before touching cod
   podman container `ollm-backend` (renamed from llama-rocm2 2026-10-02; image kyuz0/amd-strix-halo-toolboxes:rocm-7.14).
   - backend `:1245` = **our fork's patched HIP build**:
     `~/source/oLLM/vendor/llama.cpp/build-hip/bin/llama-server`
-    (branch `ckpt-persist`, tip `64dfa8058`, gfx1151 — vendored as submodule `vendor/llama.cpp`; rebuild via `~/ollm-cache/build-vendor-hip.sh`). Flags: `--parallel 3
+    (branch `ckpt-persist`, tip `64dfa8058`, gfx1151 — vendored as submodule `vendor/llama.cpp`; rebuild via `bash ops/build-vendor-hip.sh`). Flags: `--parallel 3
     --ctx-size 786432 --cache-ram 32768 --slot-save-path
     /home/rain/ollm-cache/slots` + MTP draft.
   - proxy `:1247` = `~/source/oLLM` `target/debug/ollm`, bound 0.0.0.0,
@@ -121,12 +121,12 @@ in `docs/design/` as a PR-style proposal Rain can open.
 ssh rain@192.168.178.42
 curl -s 127.0.0.1:1247/health                      # expect status ok, sig a67e59194299
 cd ~/source/oLLM && cargo test                      # expect 13 passed 0 failed
-bash ~/ollm-cache/strict-write-test.sh            # expect recall OMEGA-55, blob+ckpt pair
-python3 ~/ollm-cache/parallel_similar.py          # expect 3x cold TTFT ~10-35s
-python3 ~/ollm-cache/abort_live.py                # expect backend idle <2s after hangup
+bash tests/live/strict-write-test.sh              # expect recall OMEGA-55, blob+ckpt pair
+python3 tests/live/parallel_similar.py            # expect 3x cold TTFT ~10-35s
+python3 tests/live/abort_live.py                  # expect backend idle <2s after hangup
 ```
-Backend restart (~3 min): `podman exec ollm-backend pkill -9 -f llama-server;
-cd ~/ollm-cache && bash start-backend.sh` (idempotent; health-polls itself).
+Backend restart (~3 min): `bash ops/start-backend.sh` (idempotent; health-polls itself).
+Full teardown: `bash ops/stop-stack.sh`. Front door up: `bash ops/start-stack.sh`.
 Scary-but-correct: sig changes on restart ⇒ every blob name mismatches ⇒ turn-1
 cold prefills everywhere. Delete stale blobs to clear, never "fix" by pinning sig.
 
@@ -136,7 +136,8 @@ cold prefills everywhere. Delete stale blobs to clear, never "fix" by pinning si
 |---|---|
 | oLLM repo | box0 `~/source/oLLM` (remote matarbot/oLLM) |
 | llama.cpp fork work | box0 `~/source/oLLM/vendor/llama.cpp`, branch `ckpt-persist`; pxl read-clone `~/source/llama-cpp-work` |
-| launch scripts | box0 `~/ollm-cache/start-backend.sh` `.sh.b10664`=pre-fork backup; `start-stack.sh` = proxy |
-| test drivers | box0 `~/ollm-cache/{parallel_similar,abort_live,strict-write-test,thrash}.*`, `~/ollm-cache/e12/` |
+| launch/build scripts | repo `ops/` (start-stack, start-backend, stop-stack, build-vendor-hip; shared knobs in ops/common.sh) |
+| live test harnesses | repo `tests/live/` (strict-write, smoke, persistence-proof, stream, abort_live, parallel_similar) |
+| runtime state (untracked) | box0 `~/ollm-cache/` (`.backend_key`, `slots/`, logs) + archived `e12/`, `e1/` |
 | design corpus | `docs/design/` in oLLM repo |
 | deep-memory | `projects/ollm-proxy.md`, `projects/ollm-fork.md` |

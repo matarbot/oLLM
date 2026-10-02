@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# oLLM proxy smoke test — passthrough + first conversation + save + restart persistence
+# oLLM proxy smoke test — passthrough + first conversation + save.
+# Ritual #2. Leaves session 'first-contact' blobs for persistence-proof.sh.
 set -u
-PX=http://127.0.0.1:1247
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../ops/common.sh"
+PX="$PROXY_URL"
 echo "=== 1. passthrough /props (auth check) ==="
 curl -s --max-time 5 $PX/props | head -c 160; echo; echo
 
@@ -14,10 +16,10 @@ curl -s --max-time 90 $PX/v1/chat/completions \
 
 echo "waiting for async save..."
 for i in $(seq 1 40); do
-  [ -f /home/rain/ollm-cache/slots/first-contact.bin ] && echo "blob exists after ~${i} polls" && break
+  ls "$SLOTS_DIR" | grep -q '^first-contact.*\.bin$' && echo "blob exists after ~${i} polls" && break
   sleep 1
 done
-ls -la /home/rain/ollm-cache/slots/ | grep first-contact || echo "NO BLOB YET"
+ls -la "$SLOTS_DIR"/ | grep first-contact || echo "NO BLOB YET"
 
 echo
 echo "=== 3. continuation via proxy (same session) ==="
