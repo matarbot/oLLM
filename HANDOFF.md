@@ -3,7 +3,13 @@
 Snapshot: 2026-09-30 ~11:20 CEST. All live-state claims below were probe-verified
 at this timestamp. Read top to bottom once; re-read Pitfalls before touching code.
 
-## Live state (verified 2026-09-30)
+## Live state (verified 2026-10-02)
+
+- 2026-10-02: ops/ + tests/live/ vendored (commit 0a0a223); FULL down/build/up
+  cycle + all 6 rituals re-verified on box0 after the scripts moved: BUILD_OK
+  (vendor submodule), strict-write OMEGA-55, smoke KIWI-77 cached 52, stream
+  THETA-9 cached 42, persistence-proof restore 2.01 s, abort idle 1.3 s,
+  parallel TTFT 23.6-29.7 s. cache_limit_mb=102400 (budget per Rain).
 
 - **box0** (Strix Halo, 192.168.178.42, SSH from pxl open): prod stack runs inside
   podman container `ollm-backend` (renamed from llama-rocm2 2026-10-02; image kyuz0/amd-strix-halo-toolboxes:rocm-7.14).
